@@ -1,0 +1,66 @@
+[
+  {
+    "title": "Concrete Pad Replacement - Fort Belvoir",
+    "lat": 38.7134,
+    "lng": -77.1453,
+    "naics": "238110",
+    "due_date": "2025-02-15",
+    "agency": "USACE"
+  },
+  {
+    "title": "Ready Mix Concrete Delivery - Virginia Beach",
+    "lat": 36.8529,
+    "lng": -75.9780,
+    "naics": "327320",
+    "due_date": "2025-03-01",
+    "agency": "NAVFAC"
+  },
+  {
+    "title": "Cement Plant Maintenance - Richmond",
+    "lat": 37.5407,
+    "lng": -77.4360,
+    "naics": "327300",
+    "due_date": "2025-01-30",
+    "agency": "GSA"
+  },
+  {
+    "title": "Concrete Foundation Work - Norfolk Naval Base",
+    "lat": 36.9469,
+    "lng": -76.3130,
+    "naics": "238110",
+    "due_date": "2025-02-20",
+    "agency": "NAVFAC"
+  },
+  {
+    "title": "Ready Mix Supply - Charlottesville",
+    "lat": 38.0293,
+    "lng": -78.4767,
+    "naics": "327320",
+    "due_date": "2025-02-10",
+    "agency": "VA State"
+  },
+  {
+    "title": "Concrete Sidewalk Repair - Alexandria",
+    "lat": 38.8048,
+    "lng": -77.0469,
+    "naics": "238110",
+    "due_date": "2025-01-25",
+    "agency": "GSA"
+  },
+  {
+    "title": "Cement Production Equipment - Roanoke",
+    "lat": 37.2710,
+    "lng": -79.9414,
+    "naics": "327300",
+    "due_date": "2025-03-15",
+    "agency": "USACE"
+  },
+  {
+    "title": "Ready Mix Concrete - Newport News",
+    "lat": 37.0871,
+    "lng": -76.4730,
+    "naics": "327320",
+    "due_date": "2025-02-05",
+    "agency": "NAVFAC"
+  }
+]

@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Site Scout Lite - Geospatial Analytics</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <!-- Top Bar -->
+    <div class="top-bar">
+        <div class="top-bar-left">
+            <h1 class="project-title">Site Scout Lite</h1>
+        </div>
+        <div class="top-bar-right">
+            <div class="search-group">
+                <input 
+                    type="text" 
+                    id="placesSearch" 
+                    class="search-input" 
+                    placeholder="Search places..."
+                >
+                <button id="searchPlacesBtn" class="btn-search">Search Places</button>
+            </div>
+            <div class="drive-time-group">
+                <label for="driveTimeSelect">Drive Time:</label>
+                <select id="driveTimeSelect" class="drive-time-select">
+                    <option value="30">30 minutes</option>
+                    <option value="45">45 minutes</option>
+                    <option value="60">60 minutes</option>
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <div class="container">
+        <!-- Left Control Panel -->
+        <div class="control-panel">
+            <button id="loadSAMBtn" class="btn-primary">Load SAM Projects</button>
+            
+            <div class="legend">
+                <h3>Legend</h3>
+                <div class="legend-item">
+                    <div class="legend-marker sam-marker"></div>
+                    <span>SAM Projects</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-marker places-marker"></div>
+                    <span>Places Results</span>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Map Container -->
+        <div id="map" class="map-container"></div>
+    </div>
+    
+    <!-- Toast Notification Container -->
+    <div id="toastContainer" class="toast-container"></div>
+    
+    <!-- Google Maps JavaScript API -->
+    <script src="https://maps.googleapis.com/maps/api/js?key=YOUR_API_KEY"></script>
+    <script src="/static/app.js"></script>
+</body>
+</html>

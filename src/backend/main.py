@@ -1,0 +1,196 @@
+"""
+FastAPI main application for Site Scout Lite.
+Serves API endpoints and static frontend files.
+"""
+import logging
+from datetime import date, timedelta
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from sam_client import fetch_projects, fetch_live_projects
+from iso_client import get_isochrone
+from places_client import search_places
+
+# Configure structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Create FastAPI app
+app = FastAPI(title="Site Scout Lite API", version="1.0.0")
+
+# Enable CORS for frontend access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify actual origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount static files (frontend)
+frontend_path = os.path.join(os.path.dirname(__file__), "..", "frontend")
+if os.path.exists(frontend_path):
+    app.mount("/static", StaticFiles(directory=frontend_path), name="static")
+
+
+@app.get("/")
+async def root():
+    """Serve the main index.html file"""
+    frontend_file = os.path.join(os.path.dirname(__file__), "..", "frontend", "index.html")
+    if os.path.exists(frontend_file):
+        return FileResponse(frontend_file)
+    return {"message": "Frontend not found"}
+
+
+@app.get("/api/health")
+async def health():
+    """Health check endpoint"""
+    return {"status": "ok"}
+
+
+@app.get("/api/projects")
+async def get_projects(mock: Optional[bool] = Query(False, description="Use mock data (set to 'true' for mock mode)")):
+    """
+    Fetch SAM.gov projects filtered by NAICS codes and Virginia state.
+    
+    Args:
+        mock: Optional query parameter. Set to 'true' to use mock data from sample_sam.json
+        
+    Returns:
+        List of normalized project objects. Each project contains:
+        - id: Notice ID
+        - title: Project title
+        - posted_date: Date posted
+        - response_deadline: Response deadline
+        - naics: NAICS code
+        - project_type: Project type (e.g., "Award Notice")
+        - department: Department/agency name
+        - city: City location
+        - state: State location
+        - zipcode: ZIP code
+        - country: Country code
+        - address: Full address string
+        - lat: Latitude (geocoded)
+        - lng: Longitude (geocoded)
+        - estimated_award_amount: Estimated award amount (float)
+        - ui_link: UI link to SAM.gov opportunity
+    """
+    try:
+        if mock:
+            # Use mock data from sample_sam.json
+            projects = fetch_projects(mock=True)
+            logger.info(f"Returning {len(projects)} mock projects")
+            return projects
+        else:
+            # Use live SAM.gov API with date range (last 90 days)
+            today = date.today()
+            posted_to = today
+            posted_from = today - timedelta(days=90)
+            
+            projects = fetch_live_projects(
+                posted_from=posted_from,
+                posted_to=posted_to,
+                limit=50,
+                ptype="a"  # Award Notice type
+            )
+            logger.info(f"Returning {len(projects)} live projects from SAM.gov")
+            return projects
+    except Exception as e:
+        logger.error(f"Error in /api/projects: {e}")
+        # Fall back to mock data on error
+        logger.info("Falling back to mock data due to error")
+        try:
+            projects = fetch_projects(mock=True)
+            return projects
+        except Exception as fallback_error:
+            logger.error(f"Error loading mock data: {fallback_error}")
+            raise HTTPException(status_code=500, detail=f"Error fetching projects: {str(e)}")
+
+
+@app.get("/api/isochrones")
+async def get_isochrones(
+    lat: float = Query(..., description="Latitude"),
+    lng: float = Query(..., description="Longitude"),
+    minutes: int = Query(30, description="Travel time in minutes (30, 45, or 60)"),
+    mock: Optional[bool] = Query(False, description="Use mock data (set to 'true' for mock mode)")
+):
+    """
+    Generate isochrone polygon for given location and travel time.
+    
+    Args:
+        lat: Latitude of center point
+        lng: Longitude of center point
+        minutes: Travel time in minutes (30, 45, or 60)
+        mock: Optional query parameter. Set to 'true' to return mock polygon
+        
+    Returns:
+        GeoJSON Feature with polygon geometry
+    """
+    try:
+        # Validate minutes
+        if minutes not in [30, 45, 60]:
+            raise HTTPException(
+                status_code=400,
+                detail="minutes must be 30, 45, or 60"
+            )
+        
+        # Validate coordinates
+        if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid coordinates"
+            )
+        
+        isochrone = get_isochrone(lat, lng, minutes, mock=mock)
+        logger.info(f"Generated isochrone for ({lat}, {lng}), {minutes} min (mock={mock})")
+        return isochrone
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/isochrones: {e}")
+        raise HTTPException(status_code=500, detail=f"Error generating isochrone: {str(e)}")
+
+
+@app.get("/api/places")
+async def get_places(
+    q: str = Query(..., description="Search query"),
+    mock: Optional[bool] = Query(False, description="Use mock data (set to 'true' for mock mode)")
+):
+    """
+    Search for competitor facilities using Google Places API.
+    
+    Args:
+        q: Search query string
+        mock: Optional query parameter. Set to 'true' to use mock data
+        
+    Returns:
+        List of places with name, lat, lng
+    """
+    try:
+        if not q or not q.strip():
+            raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
+        
+        places = search_places(q.strip(), mock=mock)
+        logger.info(f"Found {len(places)} places for query: {q} (mock={mock})")
+        return places
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/places: {e}")
+        raise HTTPException(status_code=500, detail=f"Error searching places: {str(e)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
