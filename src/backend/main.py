@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sam_client import fetch_projects, fetch_live_projects
 from iso_client import get_isochrone
 from places_client import search_places
+from config import GOOGLE_MAPS_API_KEY
 
 # Configure structured logging
 logging.basicConfig(
@@ -46,10 +47,27 @@ if os.path.exists(frontend_path):
 
 @app.get("/")
 async def root():
-    """Serve the main index.html file"""
+    """Serve the main index.html file with Google Maps API key injected"""
     frontend_file = os.path.join(os.path.dirname(__file__), "..", "frontend", "index.html")
     if os.path.exists(frontend_file):
-        return FileResponse(frontend_file)
+        # Read the HTML file
+        with open(frontend_file, "r", encoding="utf-8") as f:
+            html_content = f.read()
+        
+        # Replace the placeholder API key with the actual key from environment
+        api_key = GOOGLE_MAPS_API_KEY
+        if not api_key:
+            logger.error("GOOGLE_MAPS_API_KEY is not set in .env file. Google Maps will not work.")
+            # Don't use placeholder - let it fail clearly
+            api_key = ""
+        else:
+            logger.info("Injecting Google Maps API key into frontend")
+        
+        html_content = html_content.replace("YOUR_API_KEY", api_key)
+        
+        # Return the modified HTML
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse(content=html_content)
     return {"message": "Frontend not found"}
 
 
@@ -60,11 +78,19 @@ async def health():
 
 
 @app.get("/api/projects")
-async def get_projects(mock: Optional[bool] = Query(False, description="Use mock data (set to 'true' for mock mode)")):
+async def get_projects(
+    q: Optional[str] = Query(None, description="Search query (keyword or NAICS code)"),
+    search_type: Optional[str] = Query("keyword", description="Search type: 'keyword' or 'naics'"),
+    mock: Optional[bool] = Query(False, description="Use mock data (set to 'true' for mock mode)")
+):
     """
-    Fetch SAM.gov projects filtered by NAICS codes and Virginia state.
+    Fetch SAM.gov projects filtered by keyword search or NAICS code and Virginia state.
+    
+    Default behavior is to use live SAM.gov API. Set mock=true to use demo data.
     
     Args:
+        q: Optional search query. Can be a keyword (e.g., "concrete", "cement") or NAICS code (e.g., "327300")
+        search_type: Type of search - "keyword" (default) or "naics"
         mock: Optional query parameter. Set to 'true' to use mock data from sample_sam.json
         
     Returns:
@@ -86,36 +112,49 @@ async def get_projects(mock: Optional[bool] = Query(False, description="Use mock
         - estimated_award_amount: Estimated award amount (float)
         - ui_link: UI link to SAM.gov opportunity
     """
-    try:
-        if mock:
-            # Use mock data from sample_sam.json
-            projects = fetch_projects(mock=True)
-            logger.info(f"Returning {len(projects)} mock projects")
-            return projects
-        else:
-            # Use live SAM.gov API with date range (last 90 days)
-            today = date.today()
-            posted_to = today
-            posted_from = today - timedelta(days=90)
+    if mock:
+        # Use mock data from sample_sam.json only when explicitly requested
+        projects = fetch_projects(mock=True)
+        logger.info(f"Returning {len(projects)} mock projects (mock=true)")
+        return projects
+    else:
+        # Default: Use live SAM.gov API with date range (last 90 days)
+        # No fallback to mock - errors should be raised
+        today = date.today()
+        posted_to = today
+        posted_from = today - timedelta(days=90)
+        
+        try:
+            # Determine search type and extract query
+            search_query = q.strip() if q and q.strip() else None
+            search_type_lower = search_type.lower() if search_type else "keyword"
+            
+            keyword_query = None
+            naics_query = None
+            
+            if search_query:
+                if search_type_lower == "naics":
+                    naics_query = search_query
+                    logger.info(f"Searching by NAICS code: {naics_query}")
+                else:
+                    keyword_query = search_query
+                    logger.info(f"Searching by keyword: {keyword_query}")
             
             projects = fetch_live_projects(
                 posted_from=posted_from,
                 posted_to=posted_to,
                 limit=50,
+                keyword=keyword_query,
+                naics_code=naics_query,
                 ptype="a"  # Award Notice type
             )
-            logger.info(f"Returning {len(projects)} live projects from SAM.gov")
+            
+            search_desc = f"{search_type_lower}: {search_query}" if search_query else "all"
+            logger.info(f"Returning {len(projects)} live projects from SAM.gov ({search_desc})")
             return projects
-    except Exception as e:
-        logger.error(f"Error in /api/projects: {e}")
-        # Fall back to mock data on error
-        logger.info("Falling back to mock data due to error")
-        try:
-            projects = fetch_projects(mock=True)
-            return projects
-        except Exception as fallback_error:
-            logger.error(f"Error loading mock data: {fallback_error}")
-            raise HTTPException(status_code=500, detail=f"Error fetching projects: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error in /api/projects (live mode): {e}")
+            raise HTTPException(status_code=500, detail=f"Error fetching projects from SAM.gov: {str(e)}")
 
 
 @app.get("/api/isochrones")

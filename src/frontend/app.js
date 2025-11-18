@@ -14,7 +14,7 @@ let activeInfoWindow = null;
  * Initialize Google Map centered on Richmond, VA
  * No auto-zoom on searches (map view remains unchanged)
  */
-function initMap() {
+function initializeMap() {
     // Center on Richmond, VA (37.5407, -77.4360)
     const richmond = { lat: 37.5407, lng: -77.4360 };
     
@@ -44,6 +44,23 @@ function setupEventListeners() {
     // Load SAM Projects button
     document.getElementById("loadSAMBtn").addEventListener("click", loadSAMProjects);
     
+    // SAM search on Enter key
+    document.getElementById("samSearchInput").addEventListener("keypress", (e) => {
+        if (e.key === "Enter") {
+            loadSAMProjects();
+        }
+    });
+    
+    // Update placeholder based on search type
+    document.getElementById("samSearchType").addEventListener("change", (e) => {
+        const searchInput = document.getElementById("samSearchInput");
+        if (e.target.value === "naics") {
+            searchInput.placeholder = "e.g., 327300, 238110...";
+        } else {
+            searchInput.placeholder = "e.g., concrete, cement...";
+        }
+    });
+    
     // Search Places button
     document.getElementById("searchPlacesBtn").addEventListener("click", searchPlaces);
     
@@ -57,12 +74,33 @@ function setupEventListeners() {
 
 /**
  * Load SAM.gov projects from /api/projects endpoint
+ * Uses keyword search or NAICS code search based on user selection
  */
 async function loadSAMProjects() {
     try {
-        showToast("Loading SAM projects...", "info");
+        const searchQuery = document.getElementById("samSearchInput").value.trim();
+        const searchType = document.getElementById("samSearchType").value;
         
-        const response = await fetch("/api/projects");
+        // Build API URL with optional search query and type
+        let apiUrl = "/api/projects";
+        const params = new URLSearchParams();
+        
+        if (searchQuery) {
+            params.append("q", searchQuery);
+            params.append("search_type", searchType);
+        }
+        
+        if (params.toString()) {
+            apiUrl += "?" + params.toString();
+        }
+        
+        const searchTypeLabel = searchType === "naics" ? "NAICS code" : "keyword";
+        const searchMsg = searchQuery 
+            ? `Searching SAM projects by ${searchTypeLabel}: "${searchQuery}"...` 
+            : "Loading SAM projects...";
+        showToast(searchMsg, "info");
+        
+        const response = await fetch(apiUrl);
         
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
@@ -71,7 +109,10 @@ async function loadSAMProjects() {
         const projects = await response.json();
         
         if (!Array.isArray(projects) || projects.length === 0) {
-            showToast("No projects found", "warning");
+            const noResultsMsg = searchQuery 
+                ? `No projects found for ${searchTypeLabel} "${searchQuery}"` 
+                : "No projects found";
+            showToast(noResultsMsg, "warning");
             return;
         }
         
@@ -85,7 +126,10 @@ async function loadSAMProjects() {
             }
         });
         
-        showToast(`Loaded ${projects.length} projects`, "success");
+        const successMsg = searchQuery
+            ? `Found ${projects.length} project(s) for ${searchTypeLabel} "${searchQuery}"`
+            : `Loaded ${projects.length} projects`;
+        showToast(successMsg, "success");
         
     } catch (error) {
         console.error("Error loading SAM projects:", error);
@@ -295,32 +339,107 @@ async function generateIsochrone(lat, lng) {
     try {
         const minutes = parseInt(document.getElementById("driveTimeSelect").value);
         
+        console.log(`[Isochrone] Starting generation for ${minutes} minutes at (${lat}, ${lng})`);
         showToast(`Generating ${minutes}-minute isochrone...`, "info");
         
-        const response = await fetch(
-            `/api/isochrones?lat=${lat}&lng=${lng}&minutes=${minutes}`
-        );
+        // Support mock mode via URL parameter (for testing: add &mock=true to URL)
+        const urlParams = new URLSearchParams(window.location.search);
+        const useMock = urlParams.get('mock') === 'true';
+        const apiUrl = `/api/isochrones?lat=${lat}&lng=${lng}&minutes=${minutes}${useMock ? '&mock=true' : ''}`;
+        console.log(`[Isochrone] Fetching from: ${apiUrl}`);
+        if (useMock) {
+            console.log(`[Isochrone] Using MOCK mode (add ?mock=true to URL to test mock polygons)`);
+        }
+        
+        const response = await fetch(apiUrl);
         
         if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
+            const errorText = await response.text();
+            console.error(`[Isochrone] API Error - Status: ${response.status}`, errorText);
+            throw new Error(`HTTP error! status: ${response.status} - ${errorText}`);
         }
         
         const geojson = await response.json();
+        console.log("[Isochrone] API Response received:", geojson);
+        console.log("[Isochrone] Response type:", geojson.type);
+        console.log("[Isochrone] Geometry type:", geojson.geometry?.type);
+        console.log("[Isochrone] Has coordinates:", !!geojson.geometry?.coordinates);
+        
+        // Validate GeoJSON structure
+        if (!geojson.geometry) {
+            throw new Error("Invalid GeoJSON: missing geometry");
+        }
+        if (geojson.geometry.type !== "Polygon") {
+            throw new Error(`Invalid geometry type: ${geojson.geometry.type}, expected Polygon`);
+        }
+        if (!geojson.geometry.coordinates || !Array.isArray(geojson.geometry.coordinates)) {
+            throw new Error("Invalid GeoJSON: missing or invalid coordinates array");
+        }
+        if (!geojson.geometry.coordinates[0] || !Array.isArray(geojson.geometry.coordinates[0])) {
+            throw new Error("Invalid GeoJSON: missing or invalid coordinate ring");
+        }
+        
+        const coordinateRing = geojson.geometry.coordinates[0];
+        console.log(`[Isochrone] Coordinate ring length: ${coordinateRing.length}`);
+        console.log(`[Isochrone] First coordinate:`, coordinateRing[0]);
+        console.log(`[Isochrone] Last coordinate:`, coordinateRing[coordinateRing.length - 1]);
         
         // Clear previous isochrone
         if (activeIsochronePolygon) {
+            console.log("[Isochrone] Clearing previous polygon");
             activeIsochronePolygon.setMap(null);
             activeIsochronePolygon = null;
         }
         
         // Convert GeoJSON coordinates to Google Maps format
         // GeoJSON uses [lng, lat], Google Maps uses {lat, lng}
-        const coordinates = geojson.geometry.coordinates[0].map(coord => ({
-            lat: coord[1],
-            lng: coord[0]
-        }));
+        const coordinates = [];
+        let invalidCount = 0;
+        
+        for (let i = 0; i < coordinateRing.length; i++) {
+            const coord = coordinateRing[i];
+            if (!Array.isArray(coord) || coord.length < 2) {
+                console.warn(`[Isochrone] Invalid coordinate at index ${i}:`, coord);
+                invalidCount++;
+                continue;
+            }
+            
+            const lng = parseFloat(coord[0]);
+            const lat = parseFloat(coord[1]);
+            
+            if (isNaN(lng) || isNaN(lat)) {
+                console.warn(`[Isochrone] NaN coordinate at index ${i}:`, coord);
+                invalidCount++;
+                continue;
+            }
+            
+            if (!(-180 <= lng && lng <= 180) || !(-90 <= lat && lat <= 90)) {
+                console.warn(`[Isochrone] Coordinate out of range at index ${i}: [${lng}, ${lat}]`);
+                invalidCount++;
+                continue;
+            }
+            
+            coordinates.push({ lat, lng });
+        }
+        
+        if (invalidCount > 0) {
+            console.warn(`[Isochrone] Found ${invalidCount} invalid coordinates out of ${coordinateRing.length} total`);
+        }
+        
+        if (coordinates.length < 3) {
+            throw new Error(`Not enough valid coordinates: ${coordinates.length} (need at least 3)`);
+        }
+        
+        console.log(`[Isochrone] Converted ${coordinates.length} valid coordinates`);
+        console.log(`[Isochrone] Coordinate bounds:`, {
+            latMin: Math.min(...coordinates.map(c => c.lat)),
+            latMax: Math.max(...coordinates.map(c => c.lat)),
+            lngMin: Math.min(...coordinates.map(c => c.lng)),
+            lngMax: Math.max(...coordinates.map(c => c.lng))
+        });
         
         // Create polygon with TravelTime-like styling
+        console.log("[Isochrone] Creating Google Maps Polygon...");
         const polygon = new google.maps.Polygon({
             paths: coordinates,
             strokeColor: "#4285F4",
@@ -331,14 +450,27 @@ async function generateIsochrone(lat, lng) {
             map: map
         });
         
+        console.log("[Isochrone] Polygon created:", polygon);
+        console.log("[Isochrone] Polygon map:", polygon.getMap());
+        console.log("[Isochrone] Polygon paths:", polygon.getPath());
+        console.log("[Isochrone] Polygon paths length:", polygon.getPath().getLength());
+        
         activeIsochronePolygon = polygon;
         
+        // Verify polygon is on the map
+        if (!polygon.getMap()) {
+            console.error("[Isochrone] WARNING: Polygon was created but map is null!");
+            polygon.setMap(map);
+        }
+        
+        console.log("[Isochrone] Polygon successfully added to map");
         showToast(`${minutes}-minute isochrone generated`, "success");
         
         // No auto-zoom - map view remains unchanged per requirements
         
     } catch (error) {
-        console.error("Error generating isochrone:", error);
+        console.error("[Isochrone] Error generating isochrone:", error);
+        console.error("[Isochrone] Error stack:", error.stack);
         showToast("Error generating isochrone: " + error.message, "error");
     }
 }
@@ -415,16 +547,17 @@ function escapeHtml(text) {
 
 /**
  * Initialize map when Google Maps API loads
+ * This function is called by the Google Maps API callback when using async loading
  */
+window.initMap = function() {
+    if (typeof google !== "undefined" && google.maps) {
+        initializeMap();
+    } else {
+        showToast("Error: Google Maps API failed to load", "error");
+    }
+};
+
+// Fallback for synchronous loading (if async callback doesn't fire)
 if (typeof google !== "undefined" && google.maps) {
-    initMap();
-} else {
-    // Wait for API to load
-    window.addEventListener("load", () => {
-        if (typeof google !== "undefined" && google.maps) {
-            initMap();
-        } else {
-            showToast("Error: Google Maps API failed to load", "error");
-        }
-    });
+    window.initMap();
 }

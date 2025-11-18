@@ -36,7 +36,21 @@
     <div class="container">
         <!-- Left Control Panel -->
         <div class="control-panel">
-            <button id="loadSAMBtn" class="btn-primary">Load SAM Projects</button>
+            <div class="sam-search-section">
+                <label for="samSearchType">Search Type:</label>
+                <select id="samSearchType" class="sam-search-type">
+                    <option value="keyword">Keyword</option>
+                    <option value="naics">NAICS Code</option>
+                </select>
+                <label for="samSearchInput">Search Query:</label>
+                <input 
+                    type="text" 
+                    id="samSearchInput" 
+                    class="sam-search-input" 
+                    placeholder="Enter keyword or NAICS code..."
+                >
+                <button id="loadSAMBtn" class="btn-primary">Load SAM Projects</button>
+            </div>
             
             <div class="legend">
                 <h3>Legend</h3>
@@ -59,7 +73,7 @@
     <div id="toastContainer" class="toast-container"></div>
     
     <!-- Google Maps JavaScript API -->
-    <script src="https://maps.googleapis.com/maps/api/js?key=YOUR_API_KEY"></script>
+    <script async defer src="https://maps.googleapis.com/maps/api/js?key=YOUR_API_KEY&callback=initMap"></script>
     <script src="/static/app.js"></script>
 </body>
 </html>

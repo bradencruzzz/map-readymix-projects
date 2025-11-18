@@ -133,7 +133,8 @@ def fetch_live_projects(
     posted_from: date,
     posted_to: date,
     limit: int = 50,
-    title: Optional[str] = None,
+    keyword: Optional[str] = None,
+    naics_code: Optional[str] = None,
     ptype: Optional[str] = None,
 ) -> List[dict]:
     """
@@ -144,7 +145,8 @@ def fetch_live_projects(
         posted_from: Start date for opportunity search
         posted_to: End date for opportunity search
         limit: Maximum number of results to return
-        title: Optional title filter
+        keyword: Optional keyword search query (uses "Keyword Search" parameter)
+        naics_code: Optional NAICS code to filter by (e.g., "327300", "238110")
         ptype: Optional project type filter (e.g., "a" for Award Notice)
         
     Returns:
@@ -163,8 +165,10 @@ def fetch_live_projects(
         "postedTo": posted_to.strftime("%m/%d/%Y"),
     }
     
-    if title:
-        params["title"] = title
+    if keyword:
+        params["Keyword Search"] = keyword
+    if naics_code:
+        params["naicsCode"] = naics_code
     if ptype:
         params["ptype"] = ptype  # e.g., "a" for Award Notice
     
@@ -197,15 +201,11 @@ def fetch_live_projects(
         if loc.get("state") and loc.get("state") != STATE_FILTER:
             continue
         
-        # Filter by NAICS codes if naicsCode is available
-        naics_code = item.get("naicsCode")
-        if naics_code and naics_code not in NAICS_CODES:
-            continue
-        
+        # No longer filtering by NAICS codes - keyword search is handled by SAM.gov API "Keyword Search" parameter
         normalized = normalize_sam_opportunity(item)
         projects.append(normalized)
     
-    logger.info("Fetched %d projects from SAM.gov (filtered by active, USA, VA, NAICS)", len(projects))
+    logger.info("Fetched %d projects from SAM.gov (filtered by active, USA, VA, keyword search)", len(projects))
     return projects
 
 
