@@ -4,11 +4,201 @@ Returns GeoJSON polygon format for isochrone visualization.
 """
 import logging
 import math
-from typing import Dict, Any
+from datetime import datetime
+from typing import Dict, Any, Optional, Tuple
 import requests
 from config import TRAVELTIME_API_KEY, TRAVELTIME_APP_ID
 
 logger = logging.getLogger(__name__)
+
+
+def _point_in_polygon(lng: float, lat: float, polygon: list) -> bool:
+    """
+    Check if a point is inside a polygon using the ray casting algorithm.
+    
+    Args:
+        lng: Longitude of the point
+        lat: Latitude of the point
+        polygon: List of [lng, lat] coordinate pairs forming a closed polygon
+        
+    Returns:
+        True if point is inside polygon, False otherwise
+    """
+    if not polygon or len(polygon) < 3:
+        return False
+    
+    # Remove duplicate closing point if present
+    coords = polygon[:-1] if polygon[0] == polygon[-1] else polygon
+    
+    n = len(coords)
+    inside = False
+    
+    j = n - 1
+    for i in range(n):
+        xi, yi = coords[i]
+        xj, yj = coords[j]
+        
+        # Check if ray crosses edge
+        if ((yi > lat) != (yj > lat)) and (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    
+    return inside
+
+
+def _min_distance_to_polygon(lng: float, lat: float, polygon: list) -> float:
+    """
+    Calculate the minimum distance from a point to the polygon boundary.
+    
+    Args:
+        lng: Longitude of the point
+        lat: Latitude of the point
+        polygon: List of [lng, lat] coordinate pairs forming a closed polygon
+        
+    Returns:
+        Minimum distance in degrees
+    """
+    if not polygon or len(polygon) < 3:
+        return float('inf')
+    
+    # Remove duplicate closing point if present
+    coords = polygon[:-1] if polygon[0] == polygon[-1] else polygon
+    
+    min_dist = float('inf')
+    n = len(coords)
+    
+    for i in range(n):
+        # Get edge endpoints
+        x1, y1 = coords[i]
+        x2, y2 = coords[(i + 1) % n]
+        
+        # Calculate distance from point to line segment
+        # Using simplified distance calculation (approximate for small distances)
+        dx = x2 - x1
+        dy = y2 - y1
+        
+        if dx == 0 and dy == 0:
+            # Edge is a point
+            dist = math.sqrt((lng - x1) ** 2 + (lat - y1) ** 2)
+        else:
+            # Project point onto line segment
+            t = max(0, min(1, ((lng - x1) * dx + (lat - y1) * dy) / (dx * dx + dy * dy)))
+            proj_x = x1 + t * dx
+            proj_y = y1 + t * dy
+            
+            # Distance from point to projection
+            dist = math.sqrt((lng - proj_x) ** 2 + (lat - proj_y) ** 2)
+        
+        min_dist = min(min_dist, dist)
+    
+    return min_dist
+
+
+LATITUDE_KEYS = {"lat", "latitude", "y", "y_coord", "geo_lat", "center_lat"}
+LONGITUDE_KEYS = {"lng", "lon", "long", "longitude", "x", "x_coord", "geo_lng", "center_lng"}
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    try:
+        warnings = []
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_lat_lng_from_object(obj: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    lat = None
+    lng = None
+    for key, val in obj.items():
+        key_lower = key.lower()
+        if key_lower in LATITUDE_KEYS and lat is None:
+            lat = _coerce_float(val)
+        elif key_lower in LONGITUDE_KEYS and lng is None:
+            lng = _coerce_float(val)
+    return lat, lng
+
+
+def _convert_shell_to_coordinates(shell_data: Any, context: str, max_warning_logs: int = 5) -> Tuple[list, int, Optional[str]]:
+    """
+    Normalize raw TravelTime shell coordinates into GeoJSON-friendly [lng, lat] pairs.
+    Returns (valid_coords, invalid_count, coord_format)
+    """
+    valid_coords = []
+    invalid_count = 0
+    coord_format = None
+
+    if not isinstance(shell_data, (list, tuple)):
+        logger.warning(f"[Isochrone] Shell data '{context}' is not a list/tuple (type={type(shell_data).__name__})")
+        return valid_coords, invalid_count, coord_format
+
+    for idx, coord in enumerate(shell_data):
+        lng_val = None
+        lat_val = None
+
+        if isinstance(coord, dict):
+            lat_candidate, lng_candidate = _extract_lat_lng_from_object(coord)
+            if lat_candidate is not None and lng_candidate is not None:
+                lat_val = lat_candidate
+                lng_val = lng_candidate
+                if coord_format is None:
+                    coord_format = "object"
+        elif isinstance(coord, (list, tuple)) and len(coord) >= 2:
+            # CRITICAL: TravelTime API v4 documentation is unclear about coordinate order
+            # We'll parse as [lng, lat] (GeoJSON standard) initially, then detect swaps later
+            # The swap detection happens after parsing by checking if center is in bounds
+            lng_val = _coerce_float(coord[0])
+            lat_val = _coerce_float(coord[1])
+            if coord_format is None:
+                coord_format = "array"
+        else:
+            invalid_count += 1
+            if invalid_count <= max_warning_logs:
+                logger.warning(f"[Isochrone] Invalid coordinate ({context}) at index {idx}: {coord}")
+            continue
+
+        if lng_val is None or lat_val is None:
+            invalid_count += 1
+            if invalid_count <= max_warning_logs:
+                logger.warning(f"[Isochrone] Missing lat/lng ({context}) at index {idx}: {coord}")
+            continue
+
+        if not (-180 <= lng_val <= 180) or not (-90 <= lat_val <= 90):
+            invalid_count += 1
+            if invalid_count <= max_warning_logs:
+                logger.warning(f"[Isochrone] Coordinate out of range ({context}) idx {idx}: lng={lng_val}, lat={lat_val}")
+            continue
+
+        valid_coords.append([lng_val, lat_val])
+
+    return valid_coords, invalid_count, coord_format
+
+
+def _compute_bounds(coords: list) -> Dict[str, float]:
+    lng_values = [c[0] for c in coords]
+    lat_values = [c[1] for c in coords]
+    return {
+        "lng_min": min(lng_values),
+        "lng_max": max(lng_values),
+        "lat_min": min(lat_values),
+        "lat_max": max(lat_values),
+    }
+
+
+def _bounds_contain_point(bounds: Dict[str, float], lng: float, lat: float) -> bool:
+    return (
+        bounds["lng_min"] <= lng <= bounds["lng_max"] and
+        bounds["lat_min"] <= lat <= bounds["lat_max"]
+    )
+
+
+def _ensure_closed_ring(coords: list) -> list:
+    if not coords:
+        return coords
+    if coords[0] != coords[-1]:
+        return coords + [coords[0]]
+    return coords
 
 
 def get_isochrone(lat: float, lng: float, minutes: int, mock: bool = False) -> Dict[str, Any]:
@@ -40,11 +230,17 @@ def get_isochrone(lat: float, lng: float, minutes: int, mock: bool = False) -> D
         return _get_mock_polygon(lat, lng, minutes)
     
     if not TRAVELTIME_API_KEY or not TRAVELTIME_APP_ID:
-        logger.warning("TravelTime API credentials not configured, using mock polygon")
+        logger.error("TravelTime API credentials not configured!")
+        logger.error(f"  TRAVELTIME_API_KEY present: {bool(TRAVELTIME_API_KEY)}")
+        logger.error(f"  TRAVELTIME_APP_ID present: {bool(TRAVELTIME_APP_ID)}")
+        logger.warning("  → Falling back to mock polygon")
         return _get_mock_polygon(lat, lng, minutes)
     
+    # Initialize warnings list for collecting API response warnings
+    warnings = []
+    
     try:
-        # TravelTime API endpoint
+        # TravelTime API endpoint - time-map is a POST endpoint
         url = "https://api.traveltimeapp.com/v4/time-map"
         
         headers = {
@@ -53,9 +249,18 @@ def get_isochrone(lat: float, lng: float, minutes: int, mock: bool = False) -> D
             "X-Api-Key": TRAVELTIME_API_KEY
         }
         
-        # TravelTime API request body
-        # Travel time must be in seconds
+        # TravelTime API request body for POST endpoint
+        # Based on documentation: https://docs.traveltime.com/api/reference/time-map
         body = {
+            "locations": [
+                {
+                    "id": "origin",
+                    "coords": {
+                        "lat": float(lat),
+                        "lng": float(lng)
+                    }
+                }
+            ],
             "departure_searches": [
                 {
                     "id": "isochrone",
@@ -63,16 +268,18 @@ def get_isochrone(lat: float, lng: float, minutes: int, mock: bool = False) -> D
                         "lat": float(lat),
                         "lng": float(lng)
                     },
+                    "departure_time": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                    "travel_time": int(minutes * 60),  # Convert minutes to seconds
                     "transportation": {
                         "type": "driving"
-                    },
-                    "travel_time": int(minutes * 60),  # Convert minutes to seconds
-                    "departure_time": "2024-01-01T12:00:00Z"
+                    }
                 }
             ]
         }
         
-        logger.info(f"Calling TravelTime API for {minutes} minutes at ({lat}, {lng})")
+        logger.info(f"Calling TravelTime API (POST) for {minutes} minutes at ({lat}, {lng})")
+        logger.info(f"API request: coords={{lat: {lat}, lng: {lng}}}, transportation=driving, travel_time={int(minutes * 60)}s")
+        logger.debug(f"Full API request body: {body}")
         response = requests.post(url, json=body, headers=headers, timeout=30)
         response.raise_for_status()
         
@@ -143,155 +350,103 @@ def get_isochrone(lat: float, lng: float, minutes: int, mock: bool = False) -> D
                 f"Expected 'shapes' array or 'shell'/'shells' in result."
             )
         
-        # TravelTime returns coordinates as [lng, lat] pairs in the shell
-        # The shell is the outer boundary of the isochrone
-        # TravelTime API v4 may return 'shell' (singular) or 'shells' (plural array)
+        center_lng = float(lng)
+        center_lat = float(lat)
+
         first_shape = shapes[0]
         logger.info(f"First shape keys: {list(first_shape.keys())}")
-        
-        # Try to extract shell coordinates - handle both 'shell' and 'shells'
-        shell = None
-        
-        # Check for 'shell' (singular) - single outer boundary
+
+        candidate_shells = []
+
         if "shell" in first_shape:
-            shell = first_shape.get("shell", [])
+            candidate_shells.append(("shell", first_shape.get("shell", [])))
             logger.info("Found 'shell' (singular) in shape")
-        
-        # Check for 'shells' (plural) - array of outer boundaries (multiple disconnected polygons)
-        elif "shells" in first_shape:
+
+        if "shells" in first_shape:
             shells = first_shape.get("shells", [])
             logger.info(f"Found 'shells' (plural) in shape with {len(shells)} shell(s)")
-            if shells and len(shells) > 0:
-                # Use the first (largest) shell
-                shell = shells[0]
-                logger.info(f"Using first shell from shells array (length: {len(shell) if shell else 0})")
-            else:
-                logger.warning("'shells' array is empty")
-        
-        # Alternative: check if coordinates are in a different format
-        if not shell:
-            # Some API versions might return coordinates directly
-            if "coordinates" in first_shape:
-                logger.info("Found 'coordinates' key instead of 'shell'/'shells', attempting to use it")
-                shell = first_shape.get("coordinates", [])
-            elif "geometry" in first_shape and "coordinates" in first_shape.get("geometry", {}):
-                logger.info("Found GeoJSON-style geometry, extracting coordinates")
-                geom = first_shape.get("geometry", {})
-                if geom.get("type") == "Polygon" and geom.get("coordinates"):
-                    # GeoJSON Polygon format: coordinates is array of rings
-                    shell = geom["coordinates"][0] if geom["coordinates"] else []
-        
-        # Log response structure if shell still not found
-        if not shell:
-            logger.error("Could not find shell coordinates in TravelTime API response")
-            logger.error(f"Full response structure: {data}")
-            logger.error(f"Result structure: {result}")
-            logger.error(f"First shape structure: {first_shape}")
-            raise ValueError(
-                f"Could not extract shell coordinates from TravelTime API response. "
-                f"Shape keys: {list(first_shape.keys())}. "
-                f"Expected 'shell' or 'shells' key in shape object."
-            )
-        
-        logger.info(f"Shell length: {len(shell) if shell else 0}")
-        if shell and len(shell) > 0:
-            first_coord = shell[0]
-            logger.info(f"First shell coordinate: {first_coord} (type: {type(first_coord).__name__})")
-            if isinstance(first_coord, dict):
-                logger.info(f"First coordinate keys: {list(first_coord.keys())}")
-            logger.info(f"Last shell coordinate: {shell[-1]}")
-        
-        if not shell or len(shell) < 3:
-            logger.error(f"Invalid shell in TravelTime response (length: {len(shell) if shell else 0})")
-            logger.error(f"Full response structure: {data}")
-            logger.error(f"Result structure: {result}")
-            logger.error(f"First shape structure: {first_shape}")
-            raise ValueError(
-                f"Invalid shell in TravelTime API response: shell length is {len(shell) if shell else 0}, "
-                f"but need at least 3 coordinates for a valid polygon."
-            )
-        
-        # Validate coordinates are numbers
-        # TravelTime API may return coordinates as:
-        # 1. Arrays: [lng, lat] or [lat, lng]
-        # 2. Objects: {"lat": ..., "lng": ...} or {"lng": ..., "lat": ...}
-        valid_coords = []
-        invalid_count = 0
-        coord_format = None  # Track which format we're seeing
-        
-        for i, coord in enumerate(shell):
-            lng_val = None
-            lat_val = None
-            
-            # Try to parse as array/tuple [lng, lat] or [lat, lng]
-            if isinstance(coord, (list, tuple)) and len(coord) >= 2:
-                try:
-                    # Try [lng, lat] format first (GeoJSON standard)
-                    lng_val = float(coord[0])
-                    lat_val = float(coord[1])
-                    # If lng is in valid lat range and lat is in valid lng range, might be swapped
-                    if (-90 <= lng_val <= 90) and (-180 <= lat_val <= 180) and not (-90 <= lat_val <= 90):
-                        # Likely swapped - swap them
-                        logger.debug(f"Coordinate at index {i} appears swapped, correcting")
-                        lng_val, lat_val = float(coord[1]), float(coord[0])
-                    if coord_format is None:
-                        coord_format = "array"
-                except (ValueError, TypeError, IndexError) as e:
-                    logger.debug(f"Failed to parse coordinate as array at index {i}: {coord} - {e}")
-            
-            # Try to parse as object {"lat": ..., "lng": ...} or {"lng": ..., "lat": ...}
-            if (lng_val is None or lat_val is None) and isinstance(coord, dict):
-                try:
-                    # Try both key orders
-                    if "lng" in coord and "lat" in coord:
-                        lng_val = float(coord["lng"])
-                        lat_val = float(coord["lat"])
-                        if coord_format is None:
-                            coord_format = "object_lng_lat"
-                    elif "lat" in coord and "lng" in coord:
-                        lat_val = float(coord["lat"])
-                        lng_val = float(coord["lng"])
-                        if coord_format is None:
-                            coord_format = "object_lat_lng"
-                    else:
-                        logger.debug(f"Coordinate object at index {i} missing lat/lng keys: {list(coord.keys())}")
-                except (ValueError, TypeError, KeyError) as e:
-                    logger.debug(f"Failed to parse coordinate as object at index {i}: {coord} - {e}")
-            
-            # Validate the parsed values
-            if lng_val is None or lat_val is None:
-                if i < 5:  # Only log first few to avoid spam
-                    logger.warning(f"Invalid coordinate at index {i}: {coord} (type: {type(coord)})")
-                invalid_count += 1
+            for idx, shell_entry in enumerate(shells):
+                candidate_shells.append((f"shells[{idx}]", shell_entry))
+
+        if not candidate_shells and "coordinates" in first_shape:
+            logger.info("Found 'coordinates' key instead of 'shell'/'shells', attempting to use it")
+            candidate_shells.append(("coordinates", first_shape.get("coordinates", [])))
+
+        if not candidate_shells and "geometry" in first_shape:
+            geom = first_shape.get("geometry", {})
+            if geom.get("type") == "Polygon" and geom.get("coordinates"):
+                candidate_shells.append(("geometry.coordinates[0]", geom["coordinates"][0]))
+
+        if not candidate_shells:
+            logger.error("No shell data found in TravelTime response shape")
+            raise ValueError("Could not locate shell/shells/coordinates data in TravelTime API response.")
+
+        candidate_coords = []
+        for label, raw_shell in candidate_shells:
+            coords, invalid_count, coord_format = _convert_shell_to_coordinates(raw_shell, context=label)
+            if invalid_count > 0:
+                warnings.append(f"{invalid_count} invalid coordinates removed from TravelTime response ({label})")
+            if len(coords) < 3:
+                logger.warning(f"[Isochrone] Candidate shell '{label}' discarded (only {len(coords)} valid coords)")
                 continue
             
-            # Validate ranges
-            if not (-180 <= lng_val <= 180) or not (-90 <= lat_val <= 90):
-                if i < 5:  # Only log first few to avoid spam
-                    logger.warning(f"Coordinate out of range at index {i}: lng={lng_val}, lat={lat_val}")
-                invalid_count += 1
-                continue
+            # Check if coordinates might be swapped by testing both orientations
+            bounds = _compute_bounds(coords)
+            center_in_bounds = _bounds_contain_point(bounds, center_lng, center_lat)
             
-            # Valid coordinate - add as [lng, lat] for GeoJSON
-            valid_coords.append([lng_val, lat_val])
-        
-        if coord_format:
-            logger.info(f"Detected coordinate format: {coord_format}")
-        
-        if invalid_count > 0:
-            logger.warning(f"Found {invalid_count} invalid coordinates out of {len(shell)} total")
-        
-        if len(valid_coords) < 3:
-            logger.error(f"Not enough valid coordinates ({len(valid_coords)}) after validation")
-            logger.error(f"Full response structure: {data}")
-            logger.error(f"Result structure: {result}")
-            logger.error(f"First shape structure: {first_shape}")
-            logger.error(f"Shell data: {shell[:5]}... (showing first 5 coordinates)")
-            raise ValueError(
-                f"Not enough valid coordinates after validation: {len(valid_coords)} "
-                f"(need at least 3 for a valid polygon). "
-                f"Found {invalid_count} invalid coordinates out of {len(shell)} total."
-            )
+            # If center is not in bounds, try swapping coordinates
+            if not center_in_bounds:
+                logger.debug(f"[Isochrone] Center not in bounds for '{label}', checking if coordinates are swapped")
+                # Try swapping: if coords are [lat, lng], swap to [lng, lat]
+                swapped_coords = [[c[1], c[0]] for c in coords]  # Swap lat/lng
+                swapped_bounds = _compute_bounds(swapped_coords)
+                swapped_center_in_bounds = _bounds_contain_point(swapped_bounds, center_lng, center_lat)
+                
+                if swapped_center_in_bounds:
+                    logger.info(f"[Isochrone] Coordinates were swapped! Using swapped coordinates for '{label}'")
+                    coords = swapped_coords
+                    bounds = swapped_bounds
+                    coord_format = f"{coord_format}_swapped" if coord_format else "swapped"
+                else:
+                    logger.debug(f"[Isochrone] Center still not in bounds after swapping for '{label}'")
+            
+            candidate_coords.append({
+                "label": label,
+                "coords": coords,
+                "bounds": bounds,
+                "coord_format": coord_format,
+            })
+
+        if not candidate_coords:
+            logger.error("All candidate shells were invalid after coordinate normalization")
+            raise ValueError("Unable to extract a valid polygon ring from TravelTime response.")
+
+        selected_candidate = None
+        selection_reason = ""
+
+        for candidate in candidate_coords:
+            ring = _ensure_closed_ring(candidate["coords"])
+            if _point_in_polygon(center_lng, center_lat, ring):
+                selected_candidate = candidate
+                selection_reason = f"{candidate['label']} (center covered)"
+                break
+
+        if not selected_candidate:
+            for candidate in candidate_coords:
+                if _bounds_contain_point(candidate["bounds"], center_lng, center_lat):
+                    selected_candidate = candidate
+                    selection_reason = f"{candidate['label']} (bbox overlap)"
+                    break
+
+        if not selected_candidate:
+            selected_candidate = max(candidate_coords, key=lambda c: len(c["coords"]))
+            selection_reason = f"{selected_candidate['label']} (fallback longest ring)"
+
+        logger.info(f"Selected shell: {selected_candidate['label']} - reason: {selection_reason}")
+        logger.debug(f"Selected shell bounds: {selected_candidate['bounds']}")
+
+        valid_coords = list(selected_candidate["coords"])
+        coord_format = selected_candidate["coord_format"]
         
         # Convert to GeoJSON format
         # Ensure polygon is closed (first point equals last point)
@@ -301,7 +456,79 @@ def get_isochrone(lat: float, lng: float, minutes: int, mock: bool = False) -> D
             logger.debug("Polygon was not closed, added closing point")
         
         logger.info(f"Final coordinate count: {len(coordinates)}")
-        logger.debug(f"Coordinate bounds - Lng: [{min(c[0] for c in coordinates):.6f}, {max(c[0] for c in coordinates):.6f}], Lat: [{min(c[1] for c in coordinates):.6f}, {max(c[1] for c in coordinates):.6f}]")
+        
+        # Calculate bounding box of isochrone
+        lng_min = min(c[0] for c in coordinates)
+        lng_max = max(c[0] for c in coordinates)
+        lat_min = min(c[1] for c in coordinates)
+        lat_max = max(c[1] for c in coordinates)
+        
+        logger.debug(f"Coordinate bounds - Lng: [{lng_min:.6f}, {lng_max:.6f}], Lat: [{lat_min:.6f}, {lat_max:.6f}]")
+        
+        # Log center point and bounds for debugging
+        logger.info(f"Center point: ({center_lat:.6f}, {center_lng:.6f})")
+        logger.info(f"Isochrone bounds: Lng[{lng_min:.6f}, {lng_max:.6f}], Lat[{lat_min:.6f}, {lat_max:.6f}]")
+        
+        # Calculate distance from center to bounding box center
+        bbox_center_lng = (lng_min + lng_max) / 2
+        bbox_center_lat = (lat_min + lat_max) / 2
+        bbox_offset_lng = abs(center_lng - bbox_center_lng)
+        bbox_offset_lat = abs(center_lat - bbox_center_lat)
+        logger.debug(f"BBox center: ({bbox_center_lat:.6f}, {bbox_center_lng:.6f})")
+        logger.debug(f"Center offset from bbox center: Lng={bbox_offset_lng:.6f}, Lat={bbox_offset_lat:.6f}")
+        
+        # First check if center is within bounding box (quick check)
+        center_in_bbox = (lng_min <= center_lng <= lng_max) and (lat_min <= center_lat <= lat_max)
+        
+        if not center_in_bbox:
+            # Calculate how far outside the bbox the center is
+            lng_offset = 0
+            lat_offset = 0
+            if center_lng < lng_min:
+                lng_offset = lng_min - center_lng
+            elif center_lng > lng_max:
+                lng_offset = center_lng - lng_max
+            if center_lat < lat_min:
+                lat_offset = lat_min - center_lat
+            elif center_lat > lat_max:
+                lat_offset = center_lat - lat_max
+            
+            logger.warning(
+                f"WARNING: Center point ({center_lat:.6f}, {center_lng:.6f}) is NOT within isochrone bounding box. "
+                f"BBox: Lng[{lng_min:.6f}, {lng_max:.6f}], Lat[{lat_min:.6f}, {lat_max:.6f}]. "
+                f"Offset: Lng={lng_offset:.6f}°, Lat={lat_offset:.6f}° "
+                f"(≈{lng_offset*111:.1f}km E/W, {lat_offset*111:.1f}km N/S). "
+                f"This indicates a significant offset issue - the isochrone may be in the wrong location."
+            )
+            warnings.append(
+                "Isochrone polygon does not enclose the requested center point. "
+                "TravelTime API may have returned an offset polygon."
+            )
+        
+        # More precise check: is center within the polygon itself
+        center_in_polygon = _point_in_polygon(center_lng, center_lat, coordinates)
+        
+        if not center_in_polygon:
+            # Calculate distance from center to nearest polygon edge
+            min_distance = _min_distance_to_polygon(center_lng, center_lat, coordinates)
+            logger.warning(
+                f"WARNING: Center point ({center_lat}, {center_lng}) is NOT within the isochrone polygon. "
+                f"Minimum distance to polygon edge: {min_distance:.6f} degrees. "
+                f"This suggests the isochrone may not be properly centered on the departure point."
+            )
+            warnings.append(
+                f"Isochrone polygon does not contain the marker. Offset ≈ {min_distance*111:.1f} km. "
+                "Consider verifying the coordinates or retrying the request."
+            )
+            # If the center is very close (within 0.01 degrees ≈ 1.1 km), it's likely a minor offset
+            # If it's far away, there's a more serious issue
+            if min_distance > 0.01:
+                logger.error(
+                    f"ERROR: Center point is {min_distance:.6f} degrees away from isochrone. "
+                    f"This is a significant offset and may indicate an API issue."
+                )
+        else:
+            logger.info(f"Center point ({center_lat}, {center_lng}) is within the isochrone polygon ✓")
         
         # GeoJSON Polygon format: coordinates is an array of linear rings
         # Each ring is an array of [lng, lat] coordinate pairs
@@ -313,8 +540,11 @@ def get_isochrone(lat: float, lng: float, minutes: int, mock: bool = False) -> D
             },
             "properties": {
                 "minutes": minutes,
-                "center": [float(lng), float(lat)],
-                "mock": False
+                "center": [center_lng, center_lat],
+                "mock": False,
+                "warnings": warnings,
+                "selection_reason": selection_reason,
+                "shell_label": selected_candidate["label"]
             }
         }
         
@@ -327,19 +557,58 @@ def get_isochrone(lat: float, lng: float, minutes: int, mock: bool = False) -> D
         logger.error(f"Error fetching isochrone from TravelTime API: {e}")
         logger.error(f"Request URL: {url}")
         logger.error(f"Request headers: {headers}")
-        logger.error(f"Request body: {body}")
         raise ValueError(f"TravelTime API request failed: {str(e)}") from e
     except (KeyError, ValueError) as e:
         # Parsing/validation errors - log full response structure for debugging
-        logger.error(f"Error parsing TravelTime API response: {e}")
+        logger.error("=" * 80)
+        logger.error(f"ERROR parsing TravelTime API response: {e}")
+        logger.error("=" * 80)
         if 'data' in locals():
-            logger.error(f"Full API response structure: {data}")
+            logger.error(f"Full API response structure:")
+            logger.error(f"  Type: {type(data)}")
+            if isinstance(data, dict):
+                logger.error(f"  Top-level keys: {list(data.keys())}")
+                if "results" in data:
+                    results = data.get("results", [])
+                    logger.error(f"  Number of results: {len(results)}")
+                    if results:
+                        first_result = results[0]
+                        logger.error(f"  First result keys: {list(first_result.keys()) if isinstance(first_result, dict) else 'NOT A DICT'}")
+                        if isinstance(first_result, dict) and "shapes" in first_result:
+                            shapes = first_result.get("shapes", [])
+                            logger.error(f"  Number of shapes: {len(shapes)}")
+                            if shapes:
+                                first_shape = shapes[0]
+                                logger.error(f"  First shape keys: {list(first_shape.keys()) if isinstance(first_shape, dict) else 'NOT A DICT'}")
+            else:
+                logger.error(f"  Response is not a dict: {str(data)[:500]}")
+        if 'result' in locals():
+            logger.error(f"Result structure: {result}")
+        if 'first_shape' in locals():
+            logger.error(f"First shape structure: {first_shape}")
+        logger.error("=" * 80)
         raise ValueError(f"Failed to parse TravelTime API response: {str(e)}") from e
     except Exception as e:
         # Unexpected errors - log everything for debugging
-        logger.error(f"Unexpected error in isochrone client: {e}", exc_info=True)
+        logger.error("=" * 80)
+        logger.error(f"UNEXPECTED ERROR in isochrone client: {e}")
+        logger.error("=" * 80)
+        logger.error(f"Exception type: {type(e).__name__}")
+        logger.error(f"Exception message: {str(e)}")
+        import traceback
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
         if 'data' in locals():
-            logger.error(f"Full API response structure: {data}")
+            logger.error(f"Full API response structure:")
+            logger.error(f"  Type: {type(data)}")
+            if isinstance(data, dict):
+                logger.error(f"  Top-level keys: {list(data.keys())}")
+            else:
+                logger.error(f"  Response is not a dict: {str(data)[:500]}")
+        if 'result' in locals():
+            logger.error(f"Result structure: {result}")
+        if 'first_shape' in locals():
+            logger.error(f"First shape structure: {first_shape}")
+        logger.error("=" * 80)
         raise ValueError(f"Unexpected error processing TravelTime API response: {str(e)}") from e
 
 
@@ -406,6 +675,19 @@ def _get_mock_polygon(lat: float, lng: float, minutes: int) -> Dict[str, Any]:
     logger.info(f"Generated {len(coordinates)} coordinates for mock polygon")
     logger.debug(f"Mock coordinate bounds - Lng: [{min(c[0] for c in coordinates):.6f}, {max(c[0] for c in coordinates):.6f}], Lat: [{min(c[1] for c in coordinates):.6f}, {max(c[1] for c in coordinates):.6f}]")
     
+    # Validate that the center point is within the mock polygon (it should always be for a circle)
+    center_lng = float(lng)
+    center_lat = float(lat)
+    center_in_polygon = _point_in_polygon(center_lng, center_lat, coordinates)
+    
+    if not center_in_polygon:
+        logger.warning(
+            f"WARNING: Center point ({center_lat}, {center_lng}) is NOT within the mock isochrone polygon. "
+            f"This should not happen for a circular polygon. Check coordinate calculations."
+        )
+    else:
+        logger.debug(f"Mock polygon center validation: Center point is within polygon ✓")
+    
     geojson = {
         "type": "Feature",
         "geometry": {
@@ -414,8 +696,11 @@ def _get_mock_polygon(lat: float, lng: float, minutes: int) -> Dict[str, Any]:
         },
         "properties": {
             "minutes": minutes,
-            "center": [float(lng), float(lat)],
-            "mock": True
+            "center": [center_lng, center_lat],
+            "mock": True,
+            "warnings": [] if center_in_polygon else ["Mock polygon does not enclose the center point (unexpected)."],
+            "selection_reason": "mock_circle",
+            "shell_label": "mock_circle"
         }
     }
     

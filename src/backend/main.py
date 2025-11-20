@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 import sys
 import os
+import requests
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -20,9 +21,9 @@ from iso_client import get_isochrone
 from places_client import search_places
 from config import GOOGLE_MAPS_API_KEY
 
-# Configure structured logging
+# Configure structured logging - set to DEBUG to see detailed diagnostic info
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -125,9 +126,15 @@ async def get_projects(
         posted_from = today - timedelta(days=90)
         
         try:
-            # Determine search type and extract query
-            search_query = q.strip() if q and q.strip() else None
-            search_type_lower = search_type.lower() if search_type else "keyword"
+            # Determine search type and extract query - handle None and empty strings safely
+            search_query = None
+            if q:
+                if isinstance(q, str):
+                    search_query = q.strip() if q.strip() else None
+                else:
+                    search_query = str(q).strip() if str(q).strip() else None
+            
+            search_type_lower = (search_type.lower() if search_type and isinstance(search_type, str) else "keyword")
             
             keyword_query = None
             naics_query = None
@@ -152,9 +159,32 @@ async def get_projects(
             search_desc = f"{search_type_lower}: {search_query}" if search_query else "all"
             logger.info(f"Returning {len(projects)} live projects from SAM.gov ({search_desc})")
             return projects
+        except RuntimeError as e:
+            # RuntimeError from SAM client (e.g., missing API key, rate limit)
+            logger.error(f"Runtime error in /api/projects: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+        except requests.exceptions.HTTPError as e:
+            # HTTP errors from SAM.gov API
+            status_code = e.response.status_code if e.response else 500
+            logger.error(f"HTTP error calling SAM.gov API: {status_code} - {e}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"SAM.gov API error: {status_code} - {str(e)}"
+            )
+        except requests.exceptions.RequestException as e:
+            # Network/timeout errors
+            logger.error(f"Network error calling SAM.gov API: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Network error connecting to SAM.gov API: {str(e)}"
+            )
         except Exception as e:
-            logger.error(f"Error in /api/projects (live mode): {e}")
-            raise HTTPException(status_code=500, detail=f"Error fetching projects from SAM.gov: {str(e)}")
+            # Catch-all for unexpected errors
+            logger.error(f"Unexpected error in /api/projects (live mode): {e}", exc_info=True)
+            import traceback
+            error_detail = f"Error fetching projects from SAM.gov: {str(e)}"
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=error_detail)
 
 
 @app.get("/api/isochrones")

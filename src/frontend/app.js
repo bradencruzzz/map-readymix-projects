@@ -9,6 +9,22 @@ let samMarkers = [];
 let placesMarkers = [];
 let activeIsochronePolygon = null;
 let activeInfoWindow = null;
+let isGeneratingIsochrone = false; // Prevent concurrent isochrone generation
+
+/**
+ * Global function to be called from InfoWindow buttons
+ * InfoWindows render in a separate context, so we need a global function
+ * Define this early to ensure it's available when InfoWindows are created
+ */
+window.generateIsochroneFromInfo = function(lat, lng) {
+    console.log(`[Isochrone] Button clicked for (${lat}, ${lng})`);
+    if (typeof generateIsochrone === 'function') {
+        generateIsochrone(lat, lng);
+    } else {
+        console.error("[Isochrone] generateIsochrone function not available yet");
+        alert("Map is still loading. Please wait a moment and try again.");
+    }
+};
 
 /**
  * Initialize Google Map centered on Richmond, VA
@@ -82,12 +98,20 @@ async function loadSAMProjects() {
         const searchType = document.getElementById("samSearchType").value;
         
         // Build API URL with optional search query and type
+        // Support mock mode via URL parameter (for testing: add &mock=true to URL)
+        const urlParams = new URLSearchParams(window.location.search);
+        const useMock = urlParams.get('mock') === 'true';
+        
         let apiUrl = "/api/projects";
         const params = new URLSearchParams();
         
         if (searchQuery) {
             params.append("q", searchQuery);
             params.append("search_type", searchType);
+        }
+        
+        if (useMock) {
+            params.append("mock", "true");
         }
         
         if (params.toString()) {
@@ -119,16 +143,56 @@ async function loadSAMProjects() {
         // Clear existing SAM markers
         clearSAMMarkers();
         
-        // Add markers for each project
+        // Add markers for each project and count how many have valid coordinates
+        let validProjectCount = 0;
+        let withoutCoordsCount = 0;
+        const coordinateMap = new Map(); // Track coordinates to detect duplicates
+        
         projects.forEach(project => {
             if (project.lat && project.lng) {
+                // Track coordinate usage to detect when multiple projects share same location
+                const coordKey = `${project.lat.toFixed(6)},${project.lng.toFixed(6)}`;
+                if (!coordinateMap.has(coordKey)) {
+                    coordinateMap.set(coordKey, []);
+                }
+                coordinateMap.get(coordKey).push(project);
+                
                 addSAMMarker(project);
+                validProjectCount++;
+            } else {
+                withoutCoordsCount++;
             }
         });
         
-        const successMsg = searchQuery
-            ? `Found ${projects.length} project(s) for ${searchTypeLabel} "${searchQuery}"`
-            : `Loaded ${projects.length} projects`;
+        // Check for duplicate coordinates (likely all geocoded to same location like state center)
+        const duplicateCoords = Array.from(coordinateMap.entries()).filter(([coord, projs]) => projs.length > 1);
+        if (duplicateCoords.length > 0) {
+            const totalDuplicates = duplicateCoords.reduce((sum, [coord, projs]) => sum + projs.length, 0);
+            if (totalDuplicates > 3) {
+                showToast(
+                    `Warning: ${totalDuplicates} projects share the same coordinates. They may have been geocoded to a general location (e.g., state center). Markers have been offset for visibility.`,
+                    "warning"
+                );
+            }
+        }
+        
+        // Show message with actual count of displayed markers
+        // Make it more prominent if many projects are missing coordinates
+        let successMsg;
+        if (searchQuery) {
+            successMsg = `Found ${validProjectCount} project(s) with locations for ${searchTypeLabel} "${searchQuery}"`;
+            if (withoutCoordsCount > 0) {
+                successMsg += ` (${withoutCoordsCount} without coordinates - check backend logs for geocoding details)`;
+                // Show warning toast for projects without coordinates
+                showToast(`${withoutCoordsCount} project(s) found but missing coordinates. They may not have geocodable addresses.`, "warning");
+            }
+        } else {
+            successMsg = `Loaded ${validProjectCount} projects`;
+            if (withoutCoordsCount > 0) {
+                successMsg += ` (${withoutCoordsCount} without coordinates)`;
+                showToast(`${withoutCoordsCount} project(s) missing coordinates. Check backend logs for geocoding details.`, "warning");
+            }
+        }
         showToast(successMsg, "success");
         
     } catch (error) {
@@ -139,10 +203,39 @@ async function loadSAMProjects() {
 
 /**
  * Add a SAM project marker to the map
+ * If multiple markers have identical coordinates, adds a small offset to prevent stacking
  */
 function addSAMMarker(project) {
+    // Check if we already have a marker at this exact location
+    // If so, add a small random offset (spiral pattern) to make it visible
+    let lat = project.lat;
+    let lng = project.lng;
+    
+    // Check for overlapping markers
+    const existingMarkers = samMarkers.map(m => m.marker);
+    const overlappingMarkers = existingMarkers.filter(m => {
+        const pos = m.getPosition();
+        return pos && Math.abs(pos.lat() - lat) < 0.0001 && Math.abs(pos.lng() - lng) < 0.0001;
+    });
+    
+    // If there are overlapping markers, add a small offset using a spiral pattern
+    if (overlappingMarkers.length > 0) {
+        const offsetCount = overlappingMarkers.length;
+        // Spiral offset: each overlapping marker gets offset in a circle
+        // ~50 meters per offset (0.00045 degrees ≈ 50m)
+        const offsetDistance = 0.00045; // degrees
+        const angle = (offsetCount * 60) * (Math.PI / 180); // 60 degrees between markers
+        const offsetLat = offsetDistance * Math.cos(angle);
+        const offsetLng = offsetDistance * Math.sin(angle) / Math.cos(lat * Math.PI / 180);
+        
+        lat = lat + offsetLat;
+        lng = lng + offsetLng;
+        
+        console.log(`[SAM Marker] Offset marker ${offsetCount} at (${project.lat}, ${project.lng}) to (${lat.toFixed(6)}, ${lng.toFixed(6)}) to prevent stacking`);
+    }
+    
     const marker = new google.maps.Marker({
-        position: { lat: project.lat, lng: project.lng },
+        position: { lat: lat, lng: lng },
         map: map,
         title: project.title || "SAM Project",
         icon: {
@@ -150,6 +243,12 @@ function addSAMMarker(project) {
             scaledSize: new google.maps.Size(32, 32)
         }
     });
+    
+    // Store original coordinates in marker data for isochrone generation
+    // This ensures isochrones use the actual project location, not the offset marker position
+    marker.originalLat = project.lat;
+    marker.originalLng = project.lng;
+    marker.isOffset = (Math.abs(lat - project.lat) > 0.0001 || Math.abs(lng - project.lng) > 0.0001);
     
     // Create info window content
     const infoContent = createSAMInfoContent(project, marker);
@@ -189,9 +288,19 @@ function createSAMInfoContent(project, marker) {
         ? `${escapeHtml(project.city)}, ${escapeHtml(project.state)} ${escapeHtml(project.zipcode)}`
         : (project.address || "N/A");
     
-    // Use inline onclick handler for InfoWindow compatibility
-    const lat = project.lat;
-    const lng = project.lng;
+    // Use marker's actual position for isochrone generation
+    // This ensures isochrones are centered on the visible marker (even if offset to prevent stacking)
+    const markerPos = marker.getPosition();
+    const markerLat = markerPos.lat();
+    const markerLng = markerPos.lng();
+    
+    const validLat = markerLat;
+    const validLng = markerLng;
+    
+    // Show warning if marker was offset
+    const offsetWarning = marker.isOffset 
+        ? '<div class="info-field" style="color: #ff9800; font-size: 12px; margin-top: 8px;"><em>Note: Marker offset to prevent stacking with other locations</em></div>'
+        : '';
     
     return `
         <div class="info-card">
@@ -212,6 +321,11 @@ function createSAMInfoContent(project, marker) {
                 <span class="info-label">Location:</span>
                 <span class="info-value">${address}</span>
             </div>
+            ${project.coordinates_source ? `
+            <div class="info-field">
+                <span class="info-label">Coord source:</span>
+                <span class="info-value">${escapeHtml(project.coordinates_source)}</span>
+            </div>` : ''}
             <div class="info-field">
                 <span class="info-label">Est. award:</span>
                 <span class="info-value">${formatCurrency(project.estimated_award_amount)}</span>
@@ -221,7 +335,8 @@ function createSAMInfoContent(project, marker) {
                     <a href="${escapeHtml(project.ui_link)}" target="_blank">View on SAM.gov</a>
                 </div>
             ` : ''}
-            <button class="btn-isochrone" onclick="window.generateIsochroneFromInfo(${lat}, ${lng})">
+            ${offsetWarning}
+            <button class="btn-isochrone" onclick="window.generateIsochroneFromInfo(${validLat}, ${validLng})">
                 Generate Isochrone
             </button>
         </div>
@@ -258,14 +373,16 @@ async function searchPlaces() {
         // Clear existing places markers
         clearPlacesMarkers();
         
-        // Add markers for each place
+        // Add markers for each place and count how many have valid coordinates
+        let validPlaceCount = 0;
         places.forEach(place => {
             if (place.lat && place.lng) {
                 addPlaceMarker(place);
+                validPlaceCount++;
             }
         });
         
-        showToast(`Found ${places.length} places`, "success");
+        showToast(`Found ${validPlaceCount} places${validPlaceCount < places.length ? ` (${places.length - validPlaceCount} without coordinates)` : ''}`, "success");
         
         // No auto-zoom - map view remains unchanged per requirements
         
@@ -277,10 +394,39 @@ async function searchPlaces() {
 
 /**
  * Add a place marker to the map
+ * If multiple markers have identical coordinates, adds a small offset to prevent stacking
  */
 function addPlaceMarker(place) {
+    // Check if we already have a marker at this exact location
+    // If so, add a small random offset (spiral pattern) to make it visible
+    let lat = place.lat;
+    let lng = place.lng;
+    
+    // Check for overlapping markers
+    const existingMarkers = placesMarkers.map(m => m.marker);
+    const overlappingMarkers = existingMarkers.filter(m => {
+        const pos = m.getPosition();
+        return pos && Math.abs(pos.lat() - lat) < 0.0001 && Math.abs(pos.lng() - lng) < 0.0001;
+    });
+    
+    // If there are overlapping markers, add a small offset using a spiral pattern
+    if (overlappingMarkers.length > 0) {
+        const offsetCount = overlappingMarkers.length;
+        // Spiral offset: each overlapping marker gets offset in a circle
+        // ~50 meters per offset (0.00045 degrees ≈ 50m)
+        const offsetDistance = 0.00045; // degrees
+        const angle = (offsetCount * 60) * (Math.PI / 180); // 60 degrees between markers
+        const offsetLat = offsetDistance * Math.cos(angle);
+        const offsetLng = offsetDistance * Math.sin(angle) / Math.cos(lat * Math.PI / 180);
+        
+        lat = lat + offsetLat;
+        lng = lng + offsetLng;
+        
+        console.log(`[Place Marker] Offset marker ${offsetCount} at (${place.lat}, ${place.lng}) to (${lat.toFixed(6)}, ${lng.toFixed(6)}) to prevent stacking`);
+    }
+    
     const marker = new google.maps.Marker({
-        position: { lat: place.lat, lng: place.lng },
+        position: { lat: lat, lng: lng },
         map: map,
         title: place.name || "Place",
         icon: {
@@ -288,6 +434,12 @@ function addPlaceMarker(place) {
             scaledSize: new google.maps.Size(32, 32)
         }
     });
+    
+    // Store original coordinates in marker data for isochrone generation
+    // This ensures isochrones use the actual place location, not the offset marker position
+    marker.originalLat = place.lat;
+    marker.originalLng = place.lng;
+    marker.isOffset = (Math.abs(lat - place.lat) > 0.0001 || Math.abs(lng - place.lng) > 0.0001);
     
     // Create info window content
     const infoContent = createPlaceInfoContent(place, marker);
@@ -313,9 +465,19 @@ function addPlaceMarker(place) {
  * Create HTML content for place info card
  */
 function createPlaceInfoContent(place, marker) {
-    // Use inline onclick handler for InfoWindow compatibility
-    const lat = place.lat;
-    const lng = place.lng;
+    // Use marker's actual position for isochrone generation
+    // This ensures isochrones are centered on the visible marker (even if offset to prevent stacking)
+    const markerPos = marker.getPosition();
+    const markerLat = markerPos.lat();
+    const markerLng = markerPos.lng();
+    
+    const validLat = markerLat;
+    const validLng = markerLng;
+    
+    // Show warning if marker was offset
+    const offsetWarning = marker.isOffset 
+        ? '<div class="info-field" style="color: #ff9800; font-size: 12px; margin-top: 8px;"><em>Note: Marker offset to prevent stacking with other locations</em></div>'
+        : '';
     
     return `
         <div class="info-card">
@@ -324,7 +486,8 @@ function createPlaceInfoContent(place, marker) {
                 <span class="info-label">Address:</span>
                 <span class="info-value">${escapeHtml(place.address || "N/A")}</span>
             </div>
-            <button class="btn-isochrone" onclick="window.generateIsochroneFromInfo(${lat}, ${lng})">
+            ${offsetWarning}
+            <button class="btn-isochrone" onclick="window.generateIsochroneFromInfo(${validLat}, ${validLng})">
                 Generate Isochrone
             </button>
         </div>
@@ -336,16 +499,66 @@ function createPlaceInfoContent(place, marker) {
  * Triggered by "Generate Isochrone" button click
  */
 async function generateIsochrone(lat, lng) {
+    // Prevent concurrent requests
+    if (isGeneratingIsochrone) {
+        console.log("[Isochrone] Generation already in progress, ignoring duplicate request");
+        return;
+    }
+    
+    // Ensure map is initialized
+    if (!map) {
+        console.error("[Isochrone] Map not initialized yet");
+        showToast("Map not ready. Please wait...", "error");
+        return;
+    }
+    
+    // Validate and convert coordinates to numbers
+    const parsedLat = parseFloat(lat);
+    const parsedLng = parseFloat(lng);
+    
+    // Check if coordinates are valid numbers
+    if (isNaN(parsedLat) || isNaN(parsedLng)) {
+        console.error(`[Isochrone] Invalid coordinates: lat=${lat} (${typeof lat}), lng=${lng} (${typeof lng})`);
+        showToast("Invalid coordinates. Cannot generate isochrone.", "error");
+        return;
+    }
+    
+    // Validate coordinate ranges
+    if (!(-90 <= parsedLat && parsedLat <= 90) || !(-180 <= parsedLng && parsedLng <= 180)) {
+        console.error(`[Isochrone] Coordinates out of range: lat=${parsedLat}, lng=${parsedLng}`);
+        showToast("Coordinates out of valid range. Cannot generate isochrone.", "error");
+        return;
+    }
+    
+    // Detect potential coordinate swap (if lat looks like lng and vice versa)
+    // US coordinates: lat is typically 25-50, lng is typically -125 to -65
+    // If lat is outside typical US range but lng is in typical lat range, they might be swapped
+    const typicalUSLatRange = [25, 50];
+    const typicalUSLngRange = [-125, -65];
+    const latInLngRange = typicalUSLngRange[0] <= parsedLat && parsedLat <= typicalUSLngRange[1];
+    const lngInLatRange = typicalUSLatRange[0] <= parsedLng && parsedLng <= typicalUSLatRange[1];
+    
+    if (latInLngRange && lngInLatRange) {
+        console.warn(`[Isochrone] WARNING: Coordinates may be swapped! lat=${parsedLat} (looks like lng), lng=${parsedLng} (looks like lat)`);
+        console.warn(`[Isochrone] If isochrone appears in wrong location, coordinates may need to be swapped`);
+        // Don't auto-swap, just warn - let the user verify
+    }
+    
+    isGeneratingIsochrone = true;
+    
     try {
         const minutes = parseInt(document.getElementById("driveTimeSelect").value);
         
-        console.log(`[Isochrone] Starting generation for ${minutes} minutes at (${lat}, ${lng})`);
+        console.log(`[Isochrone] Starting generation for ${minutes} minutes at (${parsedLat}, ${parsedLng})`);
+        console.log(`[Isochrone] Original input: lat=${lat} (${typeof lat}), lng=${lng} (${typeof lng})`);
+        console.log(`[Isochrone] Parsed values: lat=${parsedLat}, lng=${parsedLng}`);
         showToast(`Generating ${minutes}-minute isochrone...`, "info");
         
         // Support mock mode via URL parameter (for testing: add &mock=true to URL)
         const urlParams = new URLSearchParams(window.location.search);
         const useMock = urlParams.get('mock') === 'true';
-        const apiUrl = `/api/isochrones?lat=${lat}&lng=${lng}&minutes=${minutes}${useMock ? '&mock=true' : ''}`;
+        // Use parsed coordinates to ensure they're numbers
+        const apiUrl = `/api/isochrones?lat=${parsedLat}&lng=${parsedLng}&minutes=${minutes}${useMock ? '&mock=true' : ''}`;
         console.log(`[Isochrone] Fetching from: ${apiUrl}`);
         if (useMock) {
             console.log(`[Isochrone] Using MOCK mode (add ?mock=true to URL to test mock polygons)`);
@@ -364,6 +577,23 @@ async function generateIsochrone(lat, lng) {
         console.log("[Isochrone] Response type:", geojson.type);
         console.log("[Isochrone] Geometry type:", geojson.geometry?.type);
         console.log("[Isochrone] Has coordinates:", !!geojson.geometry?.coordinates);
+
+        // DEBUG: Log the center point from the response
+        if (geojson.properties?.center) {
+            console.log("[Isochrone] Center from API:", geojson.properties.center);
+            console.log("[Isochrone] Expected center: [" + parsedLng + ", " + parsedLat + "]");
+        }
+        
+        const backendWarnings = Array.isArray(geojson.properties?.warnings) ? geojson.properties.warnings : [];
+        if (backendWarnings.length > 0) {
+            backendWarnings.forEach((message) => {
+                console.warn("[Isochrone] Backend warning:", message);
+                showToast(message, "warning");
+            });
+        }
+        if (geojson.properties?.selection_reason) {
+            console.log("[Isochrone] Shell selection reason:", geojson.properties.selection_reason);
+        }
         
         // Validate GeoJSON structure
         if (!geojson.geometry) {
@@ -384,10 +614,14 @@ async function generateIsochrone(lat, lng) {
         console.log(`[Isochrone] First coordinate:`, coordinateRing[0]);
         console.log(`[Isochrone] Last coordinate:`, coordinateRing[coordinateRing.length - 1]);
         
-        // Clear previous isochrone
+        // Clear previous isochrone (only if it exists and is valid)
         if (activeIsochronePolygon) {
-            console.log("[Isochrone] Clearing previous polygon");
-            activeIsochronePolygon.setMap(null);
+            try {
+                console.log("[Isochrone] Clearing previous polygon");
+                activeIsochronePolygon.setMap(null);
+            } catch (e) {
+                console.warn("[Isochrone] Error clearing previous polygon:", e);
+            }
             activeIsochronePolygon = null;
         }
         
@@ -447,21 +681,37 @@ async function generateIsochrone(lat, lng) {
             strokeWeight: 2,
             fillColor: "#4285F4",
             fillOpacity: 0.2,
-            map: map
+            map: map, // Attach to map immediately
+            zIndex: 1 // Ensure polygon appears above markers
         });
+        
+        // Store reference BEFORE logging (in case logging fails)
+        activeIsochronePolygon = polygon;
         
         console.log("[Isochrone] Polygon created:", polygon);
         console.log("[Isochrone] Polygon map:", polygon.getMap());
         console.log("[Isochrone] Polygon paths:", polygon.getPath());
         console.log("[Isochrone] Polygon paths length:", polygon.getPath().getLength());
         
-        activeIsochronePolygon = polygon;
-        
-        // Verify polygon is on the map
+        // Double-check polygon is on the map (defensive programming)
         if (!polygon.getMap()) {
-            console.error("[Isochrone] WARNING: Polygon was created but map is null!");
+            console.warn("[Isochrone] WARNING: Polygon map is null, re-attaching...");
             polygon.setMap(map);
         }
+        
+        // Verify polygon is actually visible
+        if (polygon.getMap() !== map) {
+            console.error("[Isochrone] ERROR: Polygon map mismatch!");
+            polygon.setMap(map);
+        }
+        
+        // Ensure polygon is visible by checking after a brief delay
+        setTimeout(() => {
+            if (activeIsochronePolygon === polygon && !polygon.getMap()) {
+                console.warn("[Isochrone] Polygon lost map reference, re-attaching...");
+                polygon.setMap(map);
+            }
+        }, 50);
         
         console.log("[Isochrone] Polygon successfully added to map");
         showToast(`${minutes}-minute isochrone generated`, "success");
@@ -472,6 +722,9 @@ async function generateIsochrone(lat, lng) {
         console.error("[Isochrone] Error generating isochrone:", error);
         console.error("[Isochrone] Error stack:", error.stack);
         showToast("Error generating isochrone: " + error.message, "error");
+    } finally {
+        // Always reset the flag, even on error
+        isGeneratingIsochrone = false;
     }
 }
 
@@ -497,13 +750,8 @@ function clearPlacesMarkers() {
     placesMarkers = [];
 }
 
-/**
- * Global function to be called from InfoWindow buttons
- * InfoWindows render in a separate context, so we need a global function
- */
-window.generateIsochroneFromInfo = function(lat, lng) {
-    generateIsochrone(lat, lng);
-};
+// Note: window.generateIsochroneFromInfo is now defined at the top of the file
+// to ensure it's available when InfoWindows are created
 
 /**
  * Toast-style error handling and notifications
@@ -548,6 +796,7 @@ function escapeHtml(text) {
 /**
  * Initialize map when Google Maps API loads
  * This function is called by the Google Maps API callback when using async loading
+ * Define it early to ensure it's available when the callback fires
  */
 window.initMap = function() {
     if (typeof google !== "undefined" && google.maps) {
@@ -558,6 +807,12 @@ window.initMap = function() {
 };
 
 // Fallback for synchronous loading (if async callback doesn't fire)
+// Wait a bit to ensure scripts are loaded
 if (typeof google !== "undefined" && google.maps) {
-    window.initMap();
+    // Use setTimeout to ensure app.js is fully loaded
+    setTimeout(function() {
+        if (typeof initializeMap === "function") {
+            window.initMap();
+        }
+    }, 100);
 }
