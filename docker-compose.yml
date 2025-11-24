@@ -19,11 +19,10 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-    volumes:
+    # volumes:
       # Optional: Mount for development (uncomment for hot reload)
       # - ./src:/app/src
       # - ./requirements.txt:/app/requirements.txt
-      pass: {}
     networks:
       - sitescout-network
 
