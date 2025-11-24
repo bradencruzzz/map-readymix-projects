@@ -250,25 +250,18 @@ def get_isochrone(lat: float, lng: float, minutes: int, mock: bool = False) -> D
         }
         
         # TravelTime API request body for POST endpoint
-        # Based on documentation: https://docs.traveltime.com/api/reference/time-map
+        # Based on working Cloudflare Worker implementation
+        # Uses arrival_searches without locations array for simpler, more reliable requests
+        arrival_time_iso = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
         body = {
-            "locations": [
+            "arrival_searches": [
                 {
-                    "id": "origin",
-                    "coords": {
-                        "lat": float(lat),
-                        "lng": float(lng)
-                    }
-                }
-            ],
-            "departure_searches": [
-                {
-                    "id": "isochrone",
+                    "id": f"isochrone_{minutes}min_{lat:.5f}_{lng:.5f}",
                     "coords": {
                         "lat": float(lat),
                         "lng": float(lng)
                     },
-                    "departure_time": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                    "arrival_time": arrival_time_iso,
                     "travel_time": int(minutes * 60),  # Convert minutes to seconds
                     "transportation": {
                         "type": "driving"
@@ -353,32 +346,37 @@ def get_isochrone(lat: float, lng: float, minutes: int, mock: bool = False) -> D
         center_lng = float(lng)
         center_lat = float(lat)
 
-        first_shape = shapes[0]
-        logger.info(f"First shape keys: {list(first_shape.keys())}")
-
+        # Check ALL shapes, not just the first one!
+        # TravelTime API can return multiple shapes (e.g., disconnected regions)
+        # We need to find the shape that contains the center point
+        logger.info(f"Checking all {len(shapes)} shapes to find the one containing center point...")
+        
         candidate_shells = []
 
-        if "shell" in first_shape:
-            candidate_shells.append(("shell", first_shape.get("shell", [])))
-            logger.info("Found 'shell' (singular) in shape")
+        for shape_idx, shape in enumerate(shapes):
+            logger.debug(f"Checking shape {shape_idx}: {list(shape.keys())}")
 
-        if "shells" in first_shape:
-            shells = first_shape.get("shells", [])
-            logger.info(f"Found 'shells' (plural) in shape with {len(shells)} shell(s)")
-            for idx, shell_entry in enumerate(shells):
-                candidate_shells.append((f"shells[{idx}]", shell_entry))
+            if "shell" in shape:
+                candidate_shells.append((f"shape[{shape_idx}].shell", shape.get("shell", [])))
+                logger.debug(f"Found 'shell' in shape {shape_idx}")
 
-        if not candidate_shells and "coordinates" in first_shape:
-            logger.info("Found 'coordinates' key instead of 'shell'/'shells', attempting to use it")
-            candidate_shells.append(("coordinates", first_shape.get("coordinates", [])))
+            if "shells" in shape:
+                shells = shape.get("shells", [])
+                logger.debug(f"Found 'shells' (plural) in shape {shape_idx} with {len(shells)} shell(s)")
+                for idx, shell_entry in enumerate(shells):
+                    candidate_shells.append((f"shape[{shape_idx}].shells[{idx}]", shell_entry))
 
-        if not candidate_shells and "geometry" in first_shape:
-            geom = first_shape.get("geometry", {})
-            if geom.get("type") == "Polygon" and geom.get("coordinates"):
-                candidate_shells.append(("geometry.coordinates[0]", geom["coordinates"][0]))
+            if not candidate_shells and "coordinates" in shape:
+                logger.debug(f"Found 'coordinates' in shape {shape_idx}")
+                candidate_shells.append((f"shape[{shape_idx}].coordinates", shape.get("coordinates", [])))
+
+            if not candidate_shells and "geometry" in shape:
+                geom = shape.get("geometry", {})
+                if geom.get("type") == "Polygon" and geom.get("coordinates"):
+                    candidate_shells.append((f"shape[{shape_idx}].geometry.coordinates[0]", geom["coordinates"][0]))
 
         if not candidate_shells:
-            logger.error("No shell data found in TravelTime response shape")
+            logger.error("No shell data found in any TravelTime response shape")
             raise ValueError("Could not locate shell/shells/coordinates data in TravelTime API response.")
 
         candidate_coords = []
@@ -420,6 +418,14 @@ def get_isochrone(lat: float, lng: float, minutes: int, mock: bool = False) -> D
         if not candidate_coords:
             logger.error("All candidate shells were invalid after coordinate normalization")
             raise ValueError("Unable to extract a valid polygon ring from TravelTime response.")
+
+        # Log all candidates for debugging
+        logger.info(f"Found {len(candidate_coords)} candidate shells:")
+        for idx, cand in enumerate(candidate_coords):
+            center_in_bounds = _bounds_contain_point(cand['bounds'], center_lng, center_lat)
+            logger.info(f"  Candidate {idx}: {cand['label']} - {len(cand['coords'])} coords")
+            logger.info(f"    Bounds: lng [{cand['bounds']['lng_min']:.6f}, {cand['bounds']['lng_max']:.6f}], lat [{cand['bounds']['lat_min']:.6f}, {cand['bounds']['lat_max']:.6f}]")
+            logger.info(f"    Center ({center_lng:.6f}, {center_lat:.6f}) in bounds: {center_in_bounds}")
 
         selected_candidate = None
         selection_reason = ""

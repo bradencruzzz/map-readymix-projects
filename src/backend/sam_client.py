@@ -6,6 +6,7 @@ Returns simplified, business-focused project objects.
 import json
 import logging
 import os
+import time
 from collections import Counter
 from datetime import date, timedelta
 from typing import List, Dict, Optional, Tuple, Any
@@ -15,8 +16,46 @@ from geocode_client import geocode_address
 
 logger = logging.getLogger(__name__)
 
+# Caching mechanism for SAM.gov API responses
+_cache = {}
+_cache_ttl = 300  # 5 minutes cache TTL
+
+# Request throttling to avoid hitting rate limits
+_last_request_time = 0
+_min_request_interval = 2  # Minimum seconds between requests
+
 LATITUDE_KEYS = {"lat", "latitude", "lat_deg", "latdeg", "y", "ycoord", "geo_lat", "center_lat"}
 LONGITUDE_KEYS = {"lng", "lon", "long", "longitude", "long_deg", "longdeg", "x", "xcoord", "geo_lng", "center_lng"}
+
+
+def _get_cached_response(cache_key: str) -> Optional[List[dict]]:
+    """Get cached response if still valid"""
+    if cache_key in _cache:
+        cached_time, cached_data = _cache[cache_key]
+        if time.time() - cached_time < _cache_ttl:
+            logger.info(f"Returning cached SAM.gov response for: {cache_key[:50]}...")
+            return cached_data
+        else:
+            del _cache[cache_key]
+            logger.debug(f"Cache expired for: {cache_key[:50]}...")
+    return None
+
+
+def _set_cached_response(cache_key: str, data: List[dict]):
+    """Cache a response"""
+    _cache[cache_key] = (time.time(), data)
+    logger.debug(f"Cached SAM.gov response for: {cache_key[:50]}...")
+
+
+def _throttle_request():
+    """Throttle requests to avoid hitting rate limits"""
+    global _last_request_time
+    time_since_last = time.time() - _last_request_time
+    if time_since_last < _min_request_interval:
+        wait_time = _min_request_interval - time_since_last
+        logger.debug(f"Throttling SAM.gov request: waiting {wait_time:.2f} seconds")
+        time.sleep(wait_time)
+    _last_request_time = time.time()
 
 
 def _coerce_float(value: Any) -> Optional[float]:
@@ -166,6 +205,38 @@ def extract_location_fields(item: dict) -> Dict[str, Optional[str]]:
     }
 
 
+def _get_geocoding_precision_level(loc: dict, address: str) -> str:
+    """
+    Determine the precision level of a geocoded address based on available location components.
+    
+    Args:
+        loc: Location fields dictionary
+        address: The address string that was geocoded
+        
+    Returns:
+        Precision level string (e.g., "street-level", "city-level", "state-level")
+    """
+    if loc.get("city") and loc.get("state") and loc.get("zipcode"):
+        # Check if address contains street indicators
+        addr_lower = address.lower()
+        has_street = any(word in addr_lower for word in ["street", "st", "avenue", "ave", "road", "rd", "drive", "dr", "lane", "ln", "blvd", "boulevard"])
+        if has_street:
+            return "street-level"
+        return "zipcode-level"
+    elif loc.get("city") and loc.get("state"):
+        return "city-level"
+    elif loc.get("city"):
+        return "city-only"
+    elif loc.get("zipcode") and loc.get("state"):
+        return "zipcode-level"
+    elif loc.get("state"):
+        return "state-level"
+    elif loc.get("zipcode"):
+        return "zipcode-only"
+    else:
+        return "unknown"
+
+
 def build_address_string(item: dict) -> Optional[str]:
     """
     Build a freeform address string from location fields for geocoding.
@@ -310,13 +381,14 @@ def normalize_sam_opportunity(item: dict) -> dict:
         if coordinates_source == "sam":
             logger.debug(f"[{notice_id}] Skipping geocode lookup (coordinates already provided by SAM.gov)")
         else:
-            logger.info(f"[{notice_id}] Geocoding: '{address}'")
+            precision_level = _get_geocoding_precision_level(location, address)
+            logger.info(f"[{notice_id}] Geocoding: '{address}' (precision: {precision_level})")
             lat_candidate, lng_candidate = geocode_address(address)
             if lat_candidate and lng_candidate:
                 lat = lat_candidate
                 lng = lng_candidate
                 coordinates_source = "geocoded"
-                logger.info(f"[{notice_id}] Geocode success: ({lat:.4f}, {lng:.4f})")
+                logger.info(f"[{notice_id}] Geocode success: ({lat:.4f}, {lng:.4f}) [precision: {precision_level}]")
             else:
                 logger.error(f"[{notice_id}] GEOCODE FAILED")
                 logger.error(f"  Title: {title}")
@@ -398,6 +470,18 @@ def fetch_live_projects(
     if not SAM_API_KEY:
         raise RuntimeError("SAM_API_KEY is not configured; cannot call SAM.gov live.")
     
+    # Create cache key from parameters (exclude API key for security)
+    cache_key = f"{keyword}_{naics_code}_{posted_from}_{posted_to}_{limit}_{ptype}"
+    
+    # Check cache first
+    cached_result = _get_cached_response(cache_key)
+    if cached_result is not None:
+        logger.info(f"Returning {len(cached_result)} cached SAM.gov projects")
+        return cached_result
+    
+    # Throttle requests to avoid hitting rate limits
+    _throttle_request()
+    
     params = {
         "limit": limit,
         "api_key": SAM_API_KEY,
@@ -427,6 +511,15 @@ def fetch_live_projects(
     
     try:
         resp = requests.get(SAM_BASE_URL, params=params, timeout=20)
+        
+        # Check rate limit headers if available
+        rate_limit_remaining = resp.headers.get('X-RateLimit-Remaining')
+        rate_limit_reset = resp.headers.get('X-RateLimit-Reset')
+        if rate_limit_remaining:
+            logger.debug(f"SAM.gov rate limit remaining: {rate_limit_remaining}")
+            if rate_limit_remaining == '0':
+                logger.warning(f"Rate limit reached. Resets at: {rate_limit_reset}")
+        
         resp.raise_for_status()
         data = resp.json()
     except requests.exceptions.HTTPError as e:
@@ -435,11 +528,33 @@ def fetch_live_projects(
         error_text = str(e)
         response_text = e.response.text if e.response else ""
         
-        if status_code == 429 or "429" in error_text or "Too Many Requests" in error_text or "Too Many Requests" in response_text:
+        # Combine error_text and response_text for comprehensive checking
+        error_combined = (error_text + " " + (response_text or "")).lower()
+        
+        # Check for rate limiting - sometimes 500 errors contain 429 info
+        is_rate_limit = (
+            status_code == 429 or 
+            "429" in error_text or 
+            "429" in response_text or
+            "too many requests" in error_combined or
+            "rate limit" in error_combined
+        )
+        
+        if is_rate_limit:
             logger.error("SAM.gov API rate limit exceeded (429)")
             logger.error("You've made too many requests. Please wait a few minutes and try again.")
+            logger.error(f"Response details: {response_text[:500]}")
             raise RuntimeError("SAM.gov API rate limit exceeded. Please wait a few minutes and try again.") from e
         elif status_code == 500:
+            # Check if 500 error is actually a rate limit error in disguise
+            # Check both response_text AND error_text (exception message)
+            error_combined = (response_text + " " + error_text).lower()
+            if "429" in error_combined or "too many requests" in error_combined or "rate limit" in error_combined:
+                logger.error("SAM.gov API returned 500 but appears to be rate limit issue")
+                logger.error(f"Error text: {error_text[:200]}")
+                logger.error(f"Response: {response_text[:500]}")
+                raise RuntimeError("SAM.gov API rate limit exceeded (detected in 500 response). Please wait a few minutes and try again.") from e
+            
             # 500 errors often indicate invalid parameters
             logger.error(f"SAM.gov API returned 500 Internal Server Error")
             logger.error(f"Request parameters: {params}")
@@ -537,6 +652,10 @@ def fetch_live_projects(
 
     if without_coords > 0:
         logger.warning(f"  ⚠ {without_coords} projects will NOT appear on map (missing coordinates)")
+
+    # Cache the result before returning
+    _set_cached_response(cache_key, projects)
+    logger.info(f"Cached {len(projects)} SAM.gov projects for future requests")
 
     return projects
 

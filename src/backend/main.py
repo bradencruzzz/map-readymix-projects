@@ -162,11 +162,31 @@ async def get_projects(
         except RuntimeError as e:
             # RuntimeError from SAM client (e.g., missing API key, rate limit)
             logger.error(f"Runtime error in /api/projects: {e}")
+            # Check if it's a rate limit error
+            error_msg = str(e).lower()
+            logger.debug(f"Error message (lowercased): {error_msg}")
+            is_rate_limit = (
+                "rate limit" in error_msg or 
+                "429" in error_msg or 
+                "too many requests" in error_msg or
+                "rate limit exceeded" in error_msg
+            )
+            logger.debug(f"Is rate limit error: {is_rate_limit}")
+            if is_rate_limit:
+                logger.info("Returning 429 status code for rate limit error")
+                raise HTTPException(status_code=429, detail=str(e))
+            logger.info("Returning 500 status code for non-rate-limit RuntimeError")
             raise HTTPException(status_code=500, detail=str(e))
         except requests.exceptions.HTTPError as e:
             # HTTP errors from SAM.gov API
             status_code = e.response.status_code if e.response else 500
             logger.error(f"HTTP error calling SAM.gov API: {status_code} - {e}")
+            # Preserve the original status code if it's a client error (4xx)
+            if status_code and 400 <= status_code < 500:
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=f"SAM.gov API error: {status_code} - {str(e)}"
+                )
             raise HTTPException(
                 status_code=500, 
                 detail=f"SAM.gov API error: {status_code} - {str(e)}"
@@ -262,4 +282,4 @@ async def get_places(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
