@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sitescout-lite
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped
+    environment:
+      - PYTHONPATH=/app/src/backend
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/api/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    volumes:
+      # Optional: Mount for development (uncomment for hot reload)
+      # - ./src:/app/src
+      # - ./requirements.txt:/app/requirements.txt
+      pass: {}
+    networks:
+      - sitescout-network
+
+networks:
+  sitescout-network:
+    driver: bridge
+
