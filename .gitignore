@@ -31,9 +31,15 @@ env/
 ENV/
 .venv
 
+# Node modules
+node_modules/
+package-lock.json
+
 # IDE
 .vscode/
 .idea/
+.cursor/
+.claude/
 *.swp
 *.swo
 *~
