@@ -51,3 +51,26 @@ htmlcov/
 # Docker
 .dockerignore
 
+# Audit and debug files (temporary/internal use only)
+*AUDIT*.md
+*FIX*.md
+*DEBUG*.md
+*INVESTIGATION*.md
+compare_traveltime_requests.md
+traveltime_response.json
+
+# Test artifacts (generated files)
+test_fixes.py
+debug_*.py
+test_isochrone_playwright.js
+playwright-report/
+test-results/
+.playwright-mcp/
+*.png
+
+# Keep proper documentation (exceptions to wildcard rules above)
+!README.md
+!DOCKER_GUIDE.md
+!DEPENDENCIES.md
+!RELEASE_NOTES.md
+
