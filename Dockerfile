@@ -37,5 +37,5 @@ EXPOSE 8000
 
 # Run the FastAPI application with uvicorn
 # --host 0.0.0.0 allows external connections
-# --port 8000 matches EXPOSE directive
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --port overrides the default port for Azure
+CMD ["sh", "-c", "uvicorn src.backend.main:app --host 0.0.0.0 --port ${PORT}"]
