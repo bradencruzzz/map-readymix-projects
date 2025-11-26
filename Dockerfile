@@ -27,15 +27,13 @@ COPY src/backend/ ./src/backend/
 COPY src/frontend/ ./src/frontend/
 
 # Set Python path so imports work correctly
-ENV PYTHONPATH=/app/src/backend
+ENV PYTHONPATH=/app
 
-# Set working directory to backend for running the app
-WORKDIR /app/src/backend
+# Stay in /app directory
+WORKDIR /app
 
 # Expose port 8000
 EXPOSE 8000
 
 # Run the FastAPI application with uvicorn
-# --host 0.0.0.0 allows external connections
-# --port overrides the default port for Azure
 CMD ["sh", "-c", "uvicorn src.backend.main:app --host 0.0.0.0 --port ${PORT}"]

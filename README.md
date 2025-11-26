@@ -3,7 +3,7 @@
 
 **University of Virginia — Data Engineering Final Project**  
 **Author:** Braden  
-**Status:** ✅ Production Ready (Audited November 24, 2025)
+**Link:** http://100.27.250.249:8000/
 
 ---
 
@@ -25,6 +25,16 @@ This project demonstrates:
 - Full technical documentation
 
 The result is a deployable prototype of a real-world industrial analytics tool used in the construction materials industry for bid evaluation, facility planning, and competitive analysis.
+
+## How to use it and demo
+
+1. Click the link and load the app
+2. In the left search bar, change the keyword dropdown to NAICS code
+3. Put in NAICS code 238. This will search for ready-mix concrete related projects
+4. Click "Load SAM projects" and wait for the results to appear on the map
+5. In the search bar in the top right, search for "Vulcan Ready-Mix Concrete" or any place of your choice (you could even search something like Walmart if you wanted)
+6. Click any of the points to generate a 30-45-60 isocrone around it.
+
 
 ---
 
