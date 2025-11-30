@@ -1,7 +1,7 @@
 # Site Scout Lite
 ## A Containerized Geospatial Data Engineering Pipeline
 
-**University of Virginia — Data Engineering Final Project**  
+**University of Virginia — DS2022 Final Project**  
 **Author:** Braden  
 **AWS Link:** http://100.27.250.249:8000/
 
