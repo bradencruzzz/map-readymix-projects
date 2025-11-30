@@ -28,9 +28,9 @@ The result is a deployable prototype of a real-world industrial analytics tool u
 
 ## How to use it and demo via AWS
 
-Quick note: This project inlcudes various API keys that are paid and not readily available, so I decided to cloud host it so that you can use it with my API keys. You can run it in Docker, but it won't have the necessary API keys needed to use it. 
+Quick note: This project inlcudes various API keys that are paid and not readily available, so I decided to cloud host it so that you can use it with my API keys. You can run it in Docker, but it won't have the necessary API keys needed to use it. Please reach out to me to make sure my EC2 instance is running because I have very limited compute hours. 
 
-1. Click the link and load the app
+1. Click the AWS link at the top and load the app
 2. In the left search bar, change the keyword dropdown to NAICS code
 3. Put in NAICS code 238. This will search for ready-mix concrete related projects
 4. Click "Load SAM projects" and wait for the results to appear on the map
